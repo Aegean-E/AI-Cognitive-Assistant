@@ -205,7 +205,7 @@ You can control the system via natural language or slash commands.
 
 ## 🖥️ UI Features
 
--   **Chat Tab**: Main interface. Includes "Netzach Observations" panel at the bottom.
+-   **Chat Tab**: Main interface. Includes "AI Interactions" panel at the bottom.
 -   **Logs Tab**: Real-time system logs.
 -   **Memory Database Tab**:
     -   View Memories, Summaries, and Meta-Memories.
