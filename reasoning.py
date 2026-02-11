@@ -2,6 +2,7 @@ import os
 import sqlite3
 import time
 import json
+import threading
 from typing import List, Optional, Dict, Callable
 
 import numpy as np
@@ -33,6 +34,7 @@ class ReasoningStore:
         db_dir = os.path.dirname(db_path) or "."
         os.makedirs(db_dir, exist_ok=True)
         self.db_path = db_path
+        self.write_lock = threading.Lock()
         self._init_db()
         
         self.faiss_index = None
@@ -58,7 +60,8 @@ class ReasoningStore:
                     source TEXT,
                     confidence REAL DEFAULT 0.5,
                     created_at INTEGER NOT NULL,
-                    expires_at INTEGER
+                    expires_at INTEGER,
+                    metadata TEXT
                 )
             """)
             con.execute(
@@ -69,6 +72,12 @@ class ReasoningStore:
                 "CREATE INDEX IF NOT EXISTS idx_reasoning_expires "
                 "ON reasoning_nodes(expires_at);"
             )
+            
+            # Migration: Add metadata column if it doesn't exist
+            try:
+                con.execute("ALTER TABLE reasoning_nodes ADD COLUMN metadata TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     def _build_faiss_index(self):
         """Build FAISS index from active reasoning nodes."""
@@ -128,43 +137,75 @@ class ReasoningStore:
         self,
         content: str,
         source: str = "inference",
-        confidence: float = 0.5,
-        ttl_seconds: Optional[int] = 3600,
+        confidence: float = 1.0,
+        ttl_seconds: Optional[int] = 86400, # Default 1 day (Reasoning Hygiene)
+        metadata: Optional[Dict] = None,
     ) -> int:
         now = int(time.time())
         expires_at = now + ttl_seconds if ttl_seconds else None
+        metadata_json = json.dumps(metadata) if metadata else None
 
         emb = self.embed_fn(content)
         emb_json = json.dumps(emb.astype(float).tolist())
 
-        with self._connect() as con:
-            cur = con.execute(
-                """
-                INSERT INTO reasoning_nodes
-                (content, embedding, source, confidence, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (content, emb_json, source, confidence, now, expires_at),
-            )
-            row_id = cur.lastrowid
-            
-            # Update FAISS
-            if FAISS_AVAILABLE and self.faiss_index is not None:
-                emb_np = emb.reshape(1, -1).astype('float32')
-                faiss.normalize_L2(emb_np)
-                self.faiss_index.add(emb_np)
-                self.reasoning_id_mapping.append(row_id)
-            elif FAISS_AVAILABLE and self.faiss_index is None:
-                 self._build_faiss_index()
+        with self.write_lock:
+            with self._connect() as con:
+                cur = con.execute(
+                    """
+                    INSERT INTO reasoning_nodes
+                    (content, embedding, source, confidence, created_at, expires_at, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (content, emb_json, source, confidence, now, expires_at, metadata_json),
+                )
+                row_id = cur.lastrowid
+                
+                # Update FAISS
+                if FAISS_AVAILABLE and self.faiss_index is not None:
+                    emb_np = emb.reshape(1, -1).astype('float32')
+                    faiss.normalize_L2(emb_np)
+                    self.faiss_index.add(emb_np)
+                    self.reasoning_id_mapping.append(row_id)
+                elif FAISS_AVAILABLE and self.faiss_index is None:
+                     self._build_faiss_index()
 
-            return int(row_id)
+                return int(row_id)
+
+    def get_max_id(self) -> int:
+        """Get the highest reasoning node ID."""
+        with self._connect() as con:
+            row = con.execute("SELECT MAX(id) FROM reasoning_nodes").fetchone()
+            return row[0] if row and row[0] else 0
+
+    def get_reasoning_after_id(self, last_id: int, limit: int = 50) -> List[Dict]:
+        """Get reasoning nodes with ID greater than last_id."""
+        with self._connect() as con:
+            rows = con.execute("""
+                SELECT id, content, source, confidence, created_at, metadata
+                FROM reasoning_nodes
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+            """, (last_id, limit)).fetchall()
+        
+        results = []
+        for r in rows:
+            results.append({
+                "id": r[0],
+                "content": r[1],
+                "source": r[2],
+                "confidence": r[3],
+                "created_at": r[4],
+                "metadata": json.loads(r[5]) if r[5] else None
+            })
+        return results
 
     def list_recent(self, limit: int = 10) -> List[Dict]:
         """Get most recent reasoning nodes."""
         now = int(time.time())
         with self._connect() as con:
             rows = con.execute("""
-                SELECT id, content, source, confidence, created_at
+                SELECT id, content, source, confidence, created_at, metadata
                 FROM reasoning_nodes
                 WHERE expires_at IS NULL OR expires_at > ?
                 ORDER BY created_at DESC
@@ -178,7 +219,8 @@ class ReasoningStore:
                 "content": r[1],
                 "source": r[2],
                 "confidence": r[3],
-                "created_at": r[4]
+                "created_at": r[4],
+                "metadata": json.loads(r[5]) if r[5] else None
             })
         return results
 
@@ -188,7 +230,7 @@ class ReasoningStore:
     def get(self, node_id: int) -> Optional[Dict]:
         with self._connect() as con:
             row = con.execute(
-                "SELECT id, content, embedding, source, confidence, created_at, expires_at "
+                "SELECT id, content, embedding, source, confidence, created_at, expires_at, metadata "
                 "FROM reasoning_nodes WHERE id = ?",
                 (node_id,),
             ).fetchone()
@@ -202,6 +244,7 @@ class ReasoningStore:
                 "confidence": row[4],
                 "created_at": row[5],
                 "expires_at": row[6],
+                "metadata": json.loads(row[7]) if row[7] else None,
             }
 
     # --------------------------
@@ -238,7 +281,7 @@ class ReasoningStore:
                 placeholders = ','.join(['?'] * len(candidate_ids))
                 with self._connect() as con:
                     rows = con.execute(f"""
-                        SELECT id, content, source, confidence
+                        SELECT id, content, source, confidence, metadata
                         FROM reasoning_nodes
                         WHERE id IN ({placeholders})
                         AND (expires_at IS NULL OR expires_at > ?)
@@ -254,6 +297,7 @@ class ReasoningStore:
                             "similarity": candidate_scores[rid],
                             "source": r[2],
                             "confidence": r[3],
+                            "metadata": json.loads(r[4]) if r[4] else None,
                         })
                 
                 results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -266,7 +310,7 @@ class ReasoningStore:
         with self._connect() as con:
             rows = con.execute(
                 """
-                SELECT id, content, embedding, source, confidence
+                SELECT id, content, embedding, source, confidence, metadata
                 FROM reasoning_nodes
                 WHERE expires_at IS NULL OR expires_at > ?
                 """,
@@ -290,6 +334,7 @@ class ReasoningStore:
                     "similarity": sim,
                     "source": r[3],
                     "confidence": r[4],
+                    "metadata": json.loads(r[5]) if r[5] else None,
                 })
 
         results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -300,23 +345,25 @@ class ReasoningStore:
     # --------------------------
     def prune(self) -> int:
         now = int(time.time())
-        with self._connect() as con:
-            cur = con.execute(
-                "DELETE FROM reasoning_nodes "
-                "WHERE expires_at IS NOT NULL AND expires_at <= ?",
-                (now,),
-            )
-            count = cur.rowcount
-        
-        if count > 0 and FAISS_AVAILABLE:
-            # Rebuild index to remove expired items
-            self._build_faiss_index()
+        with self.write_lock:
+            with self._connect() as con:
+                cur = con.execute(
+                    "DELETE FROM reasoning_nodes "
+                    "WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                    (now,),
+                )
+                count = cur.rowcount
             
-        return count
+            if count > 0 and FAISS_AVAILABLE:
+                # Rebuild index to remove expired items
+                self._build_faiss_index()
+                
+            return count
 
     def clear(self) -> None:
-        with self._connect() as con:
-            con.execute("DELETE FROM reasoning_nodes")
-        
-        self.faiss_index = None
-        self.reasoning_id_mapping = []
+        with self.write_lock:
+            with self._connect() as con:
+                con.execute("DELETE FROM reasoning_nodes")
+            
+            self.faiss_index = None
+            self.reasoning_id_mapping = []

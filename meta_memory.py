@@ -2,6 +2,7 @@ import os
 import sqlite3
 import time
 import json
+import threading
 from typing import List, Tuple, Optional, Dict
 import numpy as np
 
@@ -29,6 +30,7 @@ class MetaMemoryStore:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.db_path = db_path
         self.embed_fn = embed_fn
+        self.write_lock = threading.Lock()
         self._init_db()
         
         self.faiss_index = None
@@ -71,10 +73,27 @@ class MetaMemoryStore:
 
             # Migration: Unify 'Decider' subject to 'Assistant'
             con.execute("UPDATE meta_memories SET subject = 'Assistant' WHERE subject = 'Decider'")
+            con.execute("UPDATE meta_memories SET subject = 'Assistant' WHERE subject = 'Daat'")
+
+            # Outcomes Table (Phase II: Credit Assignment)
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT NOT NULL,
+                    trigger_state TEXT,  -- JSON snapshot of system state
+                    result TEXT,         -- JSON result (deltas)
+                    timestamp INTEGER NOT NULL
+                )
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_outcome_action ON outcomes(action);")
 
     def _build_faiss_index(self):
         """Build FAISS index from active meta-memories."""
         try:
+            # Reset index state to prevent stale data if DB is empty
+            self.faiss_index = None
+            self.meta_id_mapping = []
+
             with self._connect() as con:
                 rows = con.execute("SELECT id, embedding FROM meta_memories WHERE embedding IS NOT NULL").fetchall()
             
@@ -128,6 +147,10 @@ class MetaMemoryStore:
         Returns:
             ID of created meta-memory
         """
+        # Enforce subject unification
+        if subject in ["Decider", "Daat"]:
+            subject = "Assistant"
+
         metadata_json = json.dumps(metadata) if metadata else None
         
         # Generate embedding
@@ -140,50 +163,84 @@ class MetaMemoryStore:
             except Exception as e:
                 print(f"⚠️ Failed to generate embedding for meta-memory: {e}")
 
-        with self._connect() as con:
-            cur = con.execute("""
-                INSERT INTO meta_memories (
-                    event_type,
-                    memory_type,
+        with self.write_lock:
+            with self._connect() as con:
+                cur = con.execute("""
+                    INSERT INTO meta_memories (
+                        event_type,
+                        memory_type,
+                        subject,
+                        text,
+                        old_id,
+                        new_id,
+                        old_value,
+                        new_value,
+                        metadata,
+                        created_at,
+                        embedding
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    event_type.upper(),
+                    memory_type.upper(),
                     subject,
-                    text,
+                    text.strip(),
                     old_id,
                     new_id,
                     old_value,
                     new_value,
-                    metadata,
-                    created_at,
-                    embedding
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                event_type.upper(),
-                memory_type.upper(),
-                subject,
-                text.strip(),
-                old_id,
-                new_id,
-                old_value,
-                new_value,
-                metadata_json,
-                int(time.time()),
-                embedding_json
-            ))
-            row_id = cur.lastrowid
-            
-            # Update FAISS
-            if FAISS_AVAILABLE and embedding is not None:
-                if self.faiss_index is None:
-                    dimension = len(embedding)
-                    self.faiss_index = faiss.IndexFlatIP(dimension)
-                    self.meta_id_mapping = []
+                    metadata_json,
+                    int(time.time()),
+                    embedding_json
+                ))
+                row_id = cur.lastrowid
                 
-                emb_np = embedding.reshape(1, -1).astype('float32')
-                faiss.normalize_L2(emb_np)
-                self.faiss_index.add(emb_np)
-                self.meta_id_mapping.append(row_id)
+                # Update FAISS
+                if FAISS_AVAILABLE and embedding is not None:
+                    if self.faiss_index is None:
+                        dimension = len(embedding)
+                        self.faiss_index = faiss.IndexFlatIP(dimension)
+                        self.meta_id_mapping = []
+                    
+                    emb_np = embedding.reshape(1, -1).astype('float32')
+                    faiss.normalize_L2(emb_np)
+                    self.faiss_index.add(emb_np)
+                    self.meta_id_mapping.append(row_id)
 
-            return row_id
+                return row_id
+
+    def add_outcome(self, action: str, trigger_state: Dict, result: Dict):
+        """
+        Record an action outcome for Reinforcement Learning.
+        """
+        with self.write_lock:
+            with self._connect() as con:
+                con.execute(
+                    "INSERT INTO outcomes (action, trigger_state, result, timestamp) VALUES (?, ?, ?, ?)",
+                    (action, json.dumps(trigger_state), json.dumps(result), int(time.time()))
+                )
+
+    def get_outcomes(self, limit: int = 100) -> List[Dict]:
+        """
+        Retrieve recent outcomes for policy analysis.
+        """
+        with self._connect() as con:
+            rows = con.execute("""
+                SELECT action, trigger_state, result, timestamp 
+                FROM outcomes 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """, (limit,)).fetchall()
+        
+        return [
+            {
+                "action": r[0],
+                "trigger_state": json.loads(r[1]) if r[1] else {},
+                "result": json.loads(r[2]) if r[2] else {},
+                "timestamp": r[3]
+            }
+            for r in rows
+        ]
 
     def add_event(self, event_type: str, subject: str, text: str) -> int:
         """
@@ -196,6 +253,30 @@ class MetaMemoryStore:
             subject=subject,
             text=text
         )
+
+    def get_max_id(self) -> int:
+        """Get the highest meta-memory ID."""
+        with self._connect() as con:
+            row = con.execute("SELECT MAX(id) FROM meta_memories").fetchone()
+            return row[0] if row and row[0] else 0
+            
+    def count_all(self) -> int:
+        """Count all meta-memories."""
+        with self._connect() as con:
+            row = con.execute("SELECT COUNT(*) FROM meta_memories").fetchone()
+            return row[0] if row else 0
+
+    def get_meta_memories_after_id(self, last_id: int, limit: int = 50) -> List[Tuple]:
+        """Get meta-memories with ID greater than last_id."""
+        with self._connect() as con:
+            rows = con.execute("""
+                SELECT id, event_type, subject, text, created_at
+                FROM meta_memories
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT ?
+            """, (last_id, limit)).fetchall()
+        return rows
 
     def list_recent(self, limit: int = 30) -> List[Tuple[int, str, str, str, str]]:
         """
@@ -259,6 +340,37 @@ class MetaMemoryStore:
                 return results[:limit]
             except Exception as e:
                 print(f"⚠️ FAISS search failed for meta-memory: {e}")
+        
+        # 2. Slow Path: Linear Scan (Fallback)
+        try:
+            with self._connect() as con:
+                rows = con.execute("SELECT id, event_type, subject, text, created_at, embedding FROM meta_memories WHERE embedding IS NOT NULL").fetchall()
+            
+            results = []
+            q_norm = np.linalg.norm(query_embedding)
+            
+            for r in rows:
+                if not r[5]: continue
+                try:
+                    emb = np.array(json.loads(r[5]), dtype=float)
+                    emb_norm = np.linalg.norm(emb)
+                    if q_norm > 0 and emb_norm > 0:
+                        sim = np.dot(query_embedding, emb) / (q_norm * emb_norm)
+                        results.append({
+                            'id': r[0],
+                            'event_type': r[1],
+                            'subject': r[2],
+                            'text': r[3],
+                            'created_at': r[4],
+                            'similarity': float(sim)
+                        })
+                except:
+                    continue
+            
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            return results[:limit]
+        except Exception as e:
+            print(f"⚠️ Linear search failed for meta-memory: {e}")
         
         return []
 
@@ -326,78 +438,106 @@ class MetaMemoryStore:
 
     def delete_by_event_type(self, event_type: str) -> int:
         """Delete meta-memories by event type."""
-        with self._connect() as con:
-            cur = con.execute("DELETE FROM meta_memories WHERE event_type = ?", (event_type.upper(),))
-            con.commit()
-            count = cur.rowcount
-        
-        if count > 0 and FAISS_AVAILABLE:
-            # Rebuild index to remove deleted items
-            self._build_faiss_index()
+        with self.write_lock:
+            with self._connect() as con:
+                cur = con.execute("DELETE FROM meta_memories WHERE event_type = ?", (event_type.upper(),))
+                con.commit()
+                count = cur.rowcount
             
-        return count
+            if count > 0 and FAISS_AVAILABLE:
+                # Rebuild index to remove deleted items
+                self._build_faiss_index()
+                
+            return count
 
     def delete_entries(self, ids: List[int]) -> int:
         """Delete specific meta-memories by ID."""
         if not ids:
             return 0
         
-        with self._connect() as con:
-            placeholders = ','.join(['?'] * len(ids))
-            cur = con.execute(f"DELETE FROM meta_memories WHERE id IN ({placeholders})", ids)
-            con.commit()
-            count = cur.rowcount
-        
-        if count > 0 and FAISS_AVAILABLE:
-            self._build_faiss_index()
+        with self.write_lock:
+            with self._connect() as con:
+                placeholders = ','.join(['?'] * len(ids))
+                cur = con.execute(f"DELETE FROM meta_memories WHERE id IN ({placeholders})", ids)
+                con.commit()
+                count = cur.rowcount
             
-        return count
+            if count > 0 and FAISS_AVAILABLE:
+                self._build_faiss_index()
+                
+            return count
+
+    def get_latest_self_narrative(self) -> Optional[Dict]:
+        """Retrieve the most recent SELF_NARRATIVE entry."""
+        with self._connect() as con:
+            row = con.execute("""
+                SELECT id, text, created_at, metadata
+                FROM meta_memories
+                WHERE event_type = 'SELF_NARRATIVE'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """).fetchone()
+        
+        if row:
+            return {
+                "id": row[0],
+                "text": row[1],
+                "created_at": row[2],
+                "metadata": json.loads(row[3]) if row[3] else {}
+            }
+        return None
 
     def clear(self):
         """DANGEROUS: Clears all meta-memories."""
-        with self._connect() as con:
-            con.execute("DELETE FROM meta_memories")
-        
-        self.faiss_index = None
-        self.meta_id_mapping = []
+        with self.write_lock:
+            with self._connect() as con:
+                con.execute("DELETE FROM meta_memories")
+            
+            self.faiss_index = None
+            self.meta_id_mapping = []
 
-    def prune_events(self, max_age_seconds: int = 259200, event_types: List[str] = None) -> int:
+    def prune_events(self, max_age_seconds: int = 259200, event_types: List[str] = None, prune_all: bool = False) -> int:
         """
         Prune old meta-memories of specific types.
         Default: Prune system operational logs older than 3 days (259200 seconds).
         """
-        if event_types is None:
-            # Default noisy types to clean up
-            event_types = [
-                "DECIDER_ACTION", 
-                "NETZACH_ACTION", 
-                "HOD_INSTRUCTION", 
-                "DECIDER_OBSERVATION_RECEIVED", 
-                "TOOL_EXECUTION",
-                "NETZACH_INFO",
-                "NETZACH_INSTRUCTION",
-                "STRATEGIC_THOUGHT",
-                "CHAIN_OF_THOUGHT"
-            ]
-            
         cutoff = int(time.time()) - max_age_seconds
         
-        if not event_types:
-            return 0
+        with self.write_lock:
+            with self._connect() as con:
+                if prune_all:
+                    cur = con.execute("DELETE FROM meta_memories WHERE created_at < ?", (cutoff,))
+                else:
+                    if event_types is None:
+                        # Default noisy types to clean up
+                        event_types = [
+                            "DECIDER_ACTION", 
+                            "NETZACH_ACTION", 
+                            "HOD_INSTRUCTION", 
+                            "DECIDER_OBSERVATION_RECEIVED", 
+                            "TOOL_EXECUTION",
+                            "NETZACH_INFO",
+                            "NETZACH_INSTRUCTION",
+                            "STRATEGIC_THOUGHT",
+                            "CHAIN_OF_THOUGHT"
+                        ]
+                    
+                    if not event_types:
+                        return 0
+                        
+                    placeholders = ','.join(['?'] * len(event_types))
+                    params = [cutoff] + event_types
+                    
+                    cur = con.execute(f"""
+                        DELETE FROM meta_memories 
+                        WHERE created_at < ? AND event_type IN ({placeholders})
+                    """, params)
+
+                con.commit()
+                count = cur.rowcount
             
-        placeholders = ','.join(['?'] * len(event_types))
-        params = [cutoff] + event_types
-        
-        with self._connect() as con:
-            cur = con.execute(f"""
-                DELETE FROM meta_memories 
-                WHERE created_at < ? AND event_type IN ({placeholders})
-            """, params)
-            con.commit()
-            count = cur.rowcount
-        
-        if count > 0 and FAISS_AVAILABLE:
-            # Rebuild index since we removed items to keep IDs in sync
-            self._build_faiss_index()
-            
-        return count
+            if count > 0 and FAISS_AVAILABLE:
+                # Rebuild index since we removed items to keep IDs in sync
+                self._build_faiss_index()
+                
+            return count

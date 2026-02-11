@@ -1,4 +1,4 @@
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 
 from memory import MemoryStore
 from meta_memory import MetaMemoryStore
@@ -8,22 +8,28 @@ TYPE_PRECEDENCE = {
     "PERMISSION": 0,  # Highest priority: only user can grant
     "RULE": 1,        # Rules from/for assistant
     "IDENTITY": 2,    # Who is user/assistant
-    "PREFERENCE": 3,  # Likes/dislikes
-    "GOAL": 4,        # Aims/desires
-    "FACT": 5,        # Objective truths
-    "BELIEF": 6,      # Opinions/convictions (lowest priority)
+    "REFUTED_BELIEF": 3, # Explicitly rejected ideas (Negative Memory)
+    "COMPLETED_GOAL": 3, # Finished objectives (Prevents re-generation)
+    "PREFERENCE": 4,  # Likes/dislikes
+    "GOAL": 5,        # Aims/desires
+    "FACT": 6,        # Objective truths
+    "BELIEF": 7,      # Opinions/convictions (lowest priority)
     "NOTE": 1,        # Assistant Notes (High priority, internal)
+    "CURIOSITY_GAP": 1, # High priority: Questions for the user
 }
 
 CONFIDENCE_MIN = {
     "PERMISSION": 0.85,  # Very high: explicit user permission (only user can grant)
     "RULE": 0.9,         # Very high: guidelines for assistant behavior
     "IDENTITY": 0.8,     # High: identity claims (who are you)
+    "REFUTED_BELIEF": 0.9, # Very high: explicit rejection
+    "COMPLETED_GOAL": 0.9, # Very high: explicit completion
     "PREFERENCE": 0.6,   # Medium-high: preferences/likes/dislikes
     "GOAL": 0.7,         # High: goals/desires
     "FACT": 0.7,         # High: factual assertions
     "BELIEF": 0.5,       # Medium: beliefs/opinions/convictions
     "NOTE": 0.9,         # Very high: manual notes
+    "CURIOSITY_GAP": 0.9, # Very high: system generated
 }
 
 
@@ -36,11 +42,12 @@ class MemoryArbiter:
     - Only enforces admission rules
     """
 
-    def __init__(self, memory_store: MemoryStore, meta_memory_store: Optional[MetaMemoryStore] = None, embed_fn: Optional[Callable] = None, log_fn: Callable[[str], None] = print):
+    def __init__(self, memory_store: MemoryStore, meta_memory_store: Optional[MetaMemoryStore] = None, embed_fn: Optional[Callable] = None, log_fn: Callable[[str], None] = print, event_bus: Any = None):
         self.memory_store = memory_store
         self.meta_memory_store = meta_memory_store
         self.embed_fn = embed_fn
         self.log = log_fn
+        self.event_bus = event_bus
 
     # --------------------------
     # Public API
@@ -60,10 +67,15 @@ class MemoryArbiter:
         """
 
         mem_type = mem_type.upper()
-        self.log(f"🔍 [Arbiter] Processing: type={mem_type}, subject={subject}, confidence={confidence}, text={text[:50]}")
+        self.log(f"🔍 [Arbiter] Processing {mem_type} for {subject} (Conf: {confidence}):\n    \"{text}\"")
 
         if mem_type not in TYPE_PRECEDENCE:
             self.log(f"❌ [Arbiter] Type '{mem_type}' not in precedence table")
+            return None
+
+        # 0️⃣ Filter out meta-actions/refutations saved as text
+        if text.strip().startswith("[Refuting Belief") or text.strip().startswith("Refuting Belief"):
+            self.log(f"⛔ [Arbiter] BLOCKING meta-action text: \"{text[:50]}...\"")
             return None
 
         # 1️⃣ Confidence gate
@@ -88,6 +100,31 @@ class MemoryArbiter:
 
         self.log(f"✅ [Arbiter] No duplicates. Previous versions: {len(previous_versions)}, parent_id: {parent_id}")
 
+        # 2.7️⃣ Negative Knowledge Enforcement (Invariant 7)
+        # Generate embedding early for checks
+        embedding = None
+        if self.embed_fn:
+            embedding = self.embed_fn(text)
+
+        if mem_type not in ("REFUTED_BELIEF", "NOTE"):
+            # Check via Embedding
+            if embedding is not None:
+                similar_mems = self.memory_store.search(embedding, limit=5)
+                for mid, mtype, msubj, mtext, sim in similar_mems:
+                    if mtype == "REFUTED_BELIEF" and sim > 0.85:
+                         self.log(f"⛔ [Arbiter] BLOCKING memory: Contradicts REFUTED_BELIEF (Sim: {sim:.2f})\n    New: \"{text}\"\n    Refuted: \"{mtext}\"")
+                         return None
+            
+            # Check via Text (Fallback/Exact)
+            refuted_list = self.memory_store.get_active_by_type("REFUTED_BELIEF")
+            text_lower = text.strip().lower()
+            for rid, rsubj, rtext, rsource in refuted_list:
+                if "[REFUTED:" in rtext:
+                    claim = rtext.split("[REFUTED:")[0].strip().lower()
+                    if text_lower == claim or (len(claim) > 10 and claim in text_lower):
+                        self.log(f"⛔ [Arbiter] BLOCKING memory: Text match with REFUTED_BELIEF.\n    New: \"{text}\"\n    Refuted: \"{rtext}\"")
+                        return None
+
         # 3️⃣ Conflict detection (exact, conservative)
         
         # 2.6️⃣ Cross-Subject Identity Conflict Guard
@@ -99,7 +136,7 @@ class MemoryArbiter:
             active_identities = self.memory_store.get_active_by_type("IDENTITY")
             active_facts = self.memory_store.get_active_by_type("FACT")
             
-            for _, subj, txt in (active_identities + active_facts):
+            for _, subj, txt, _ in (active_identities + active_facts):
                 # If subject is different (e.g. User vs Assistant)
                 if subj.lower() != subject.lower():
                     existing_val = self._extract_value(txt)
@@ -113,18 +150,14 @@ class MemoryArbiter:
         # 4️⃣ Precedence dampening
         adjusted_confidence = confidence
         for c in conflicts:
-            if TYPE_PRECEDENCE[c["type"]] > TYPE_PRECEDENCE[mem_type]:
-                adjusted_confidence *= 0.5
-                self.log(f"⚠️ [Arbiter] Dampening confidence due to conflict with {c['type']}: {confidence} -> {adjusted_confidence}")
+            if TYPE_PRECEDENCE[c["type"]] < TYPE_PRECEDENCE[mem_type]:
+                self.log(f"⛔ [Arbiter] BLOCKING memory due to conflict with higher precedence {c['type']} (ID: {c['id']}):\n    Conflict: \"{c['text']}\"")
+                return None
 
         # 5️⃣ Append-only write (versioned)
         self.log(f"✅ [Arbiter] Saving memory with adjusted_confidence={adjusted_confidence}")
         
         # Use consistent timestamp for both memory and meta-memory
-        # Generate embedding if function provided
-        embedding = None
-        if self.embed_fn:
-            embedding = self.embed_fn(text)
 
         import time
         created_at = int(time.time())
@@ -143,6 +176,20 @@ class MemoryArbiter:
             created_at=created_at,
             embedding=embedding,
         )
+
+        # If we just learned a HIGH CONFIDENCE Fact or Insight (Epiphany)
+        # and it wasn't just explicitly told to us by the User (Source != User)
+        if memory_id is not None and confidence > 0.92 and source != "User":
+            
+            # 1. Check importance (heuristic)
+            is_exciting = any(w in text.lower() for w in ["breakthrough", "critical", "proven", "refuted", "connection found"])
+            
+            if is_exciting and self.event_bus:
+                self.log(f"⚡ Epiphany detected! Signaling to user.")
+                self.event_bus.publish(
+                    "AI_SPEAK", 
+                    f"💡 Insight: I just realized that {text} (Confidence: {confidence})"
+                )
 
         # 6️⃣ Create meta-memory about this new memory creation
         if self.meta_memory_store and memory_id:

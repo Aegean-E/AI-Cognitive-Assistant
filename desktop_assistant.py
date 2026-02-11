@@ -4,7 +4,7 @@ A standalone desktop application with integrated chat, document management, and 
 """
 
 import tkinter as tk
-from tkinter import scrolledtext, filedialog, messagebox
+from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import threading
@@ -12,116 +12,19 @@ import time
 import json
 import os
 import re
-import sys
 from datetime import datetime
 import shutil
 from typing import Dict, List, Optional
 
-# Import our existing modules
-from document_store_faiss import FaissDocumentStore
-from document_processor import DocumentProcessor
-from lm import compute_embedding, run_local_lm, extract_memory_candidates, DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT
-from telegram_api import send_message, send_long_message, get_updates, get_file, download_file
-from event_bus import EventBus
-from continuousobserver import ContinuousObserver
+# Import AI Core
+from ai_core import AICore
 
-# Import Memory System
-from memory import MemoryStore
-from meta_memory import MetaMemoryStore
-from reasoning import ReasoningStore
-from memory_arbiter import MemoryArbiter
-from memory_consolidator import MemoryConsolidator
-from daydreaming import DAYDREAM_EXTRACTOR_PROMPT as DEFAULT_DAYDREAM_EXTRACTOR_PROMPT
-from decider import Decider
-from hod import Hod
+from bridges.telegram_api import TelegramBridge
 
 from ui import DesktopAssistantUI
-
-class TelegramBridge:
-    """Handles communication with Telegram API"""
-
-    def __init__(self, bot_token: str, chat_id: int):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.is_connected = False
-        self.last_update_id = None
-
-    def send_message(self, text: str) -> bool:
-        """Send message to Telegram"""
-        try:
-            send_long_message(self.bot_token, self.chat_id, text)
-            return True
-        except Exception as e:
-            print(f"❌ Telegram send error: {e}")
-            return False
-
-    def get_messages(self) -> List[Dict]:
-        """Get new messages from Telegram"""
-        try:
-            # Use offset + 1 to confirm processed messages to Telegram
-            offset = self.last_update_id + 1 if self.last_update_id is not None else None
-            updates = get_updates(self.bot_token, offset=offset)
-            messages = []
-
-            for update in updates.get("result", []):
-                # Update last_update_id to the current update's ID
-                self.last_update_id = update["update_id"]
-
-                if "message" in update:
-                    msg = update["message"]
-                    
-                    # Base message data
-                    message_data = {
-                        "id": update["update_id"],
-                        "chat_id": msg.get("chat", {}).get("id"),
-                        "from": msg.get("from", {}).get("first_name", "Unknown"),
-                        "timestamp": datetime.now().isoformat(),
-                        "date": msg.get("date", int(time.time())), # Capture Telegram timestamp
-                        "type": "unknown"
-                    }
-
-                    if "text" in msg:
-                        message_data["type"] = "text"
-                        message_data["text"] = msg["text"]
-                    elif "document" in msg:
-                        message_data["type"] = "document"
-                        message_data["document"] = msg["document"]
-                    elif "photo" in msg:
-                        message_data["type"] = "photo"
-                        # Telegram sends multiple sizes; take the last one (highest quality)
-                        message_data["photo"] = msg["photo"][-1]
-                        message_data["caption"] = msg.get("caption", "")
-                    
-                    if message_data["type"] != "unknown":
-                        messages.append(message_data)
-            return messages
-        except Exception as e:
-            print(f"❌ Telegram receive error: {e}")
-            return []
-
+from docs.commands import handle_command as process_command_logic, NON_LOCKING_COMMANDS
 
 class DesktopAssistantApp(DesktopAssistantUI):
-    # Command sets
-    RESET_CHAT = {"/resetchat", "/chatreset", "/clearchat"}
-    RESET_MEMORY = {"/resetmemory", "/memoryreset", "/clearmemory"}
-    RESET_REASONING = {"/resetreasoning", "/reasoningreset", "/clearreasoning"}
-    RESET_META_MEMORY = {"/resetmetamemory", "/metamemoryreset", "/clearmetamemory"}
-    RESET_ALL = {"/resetall", "/clearall"}
-
-    REMOVE_IDENTITY = {"/removeidentity", "/clearidentity", "/deleteidentity"}
-    REMOVE_FACT = {"/removefact", "/clearfact", "/deletefact", "/removefacts", "/clearfacts"}
-    REMOVE_PREFERENCE = {"/removepreference", "/clearpreference", "/deletepreference", "/removepreferences", "/clearpreferences"}
-    REMOVE_GOAL = {"/removegoal", "/cleargoal", "/deletegoal", "/removegoals", "/cleargoals"}
-    REMOVE_BELIEF = {"/removebelief", "/clearbelief", "/deletebelief", "/removebeliefs", "/clearbeliefs"}
-    REMOVE_PERMISSION = {"/removepermission", "/clearpermission", "/deletepermission", "/removepermissions", "/clearpermissions"}
-    REMOVE_RULE = {"/removerule", "/clearrule", "/deleterule", "/removerules", "/clearrules"}
-
-    DOCUMENT_LIST = {"/documents", "/docs", "/listdocs"}
-    DOCUMENT_REMOVE = {"/removedoc", "/removedocument", "/deletedoc", "/deletedocument"}
-    DOCUMENT_CONTENT = {"/doccontent", "/docsummarize", "/docpreview"}
-
-    # Inactivity settings
-    INACTIVITY_RESET_SECONDS = 30 * 60  # 30 minutes
 
     def __init__(self, root):
         self.root = root
@@ -134,18 +37,18 @@ class DesktopAssistantApp(DesktopAssistantUI):
         # State
         self.settings = self.load_settings()
         self.telegram_bridge = None
-        self.is_running = False
         self.observer = None
         self.connected = False
         self.is_showing_placeholder = False  # Track placeholder state
-        self.last_activity: Dict[int, float] = {} # Track last activity per chat_id
         self.stop_processing_flag = False
         self.is_processing = False
         self.daydreamer = None
         self.decider = None
         self.hod = None
+        self.keter = None
         self.start_time = time.time()
         self.processing_lock = threading.Lock()
+        self.chat_lock = threading.Lock()
         self.telegram_status_sent = False  # Track if status has been sent to avoid spam
         
         # Initialize chat mode based on settings
@@ -174,8 +77,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
 
         # Initialize Brain (Memory & Documents) - Moved after UI setup to capture logs
         self.chat_memory = {}
-        self.init_brain()
-        self.document_processor = DocumentProcessor(embed_fn=self.get_embedding_fn())
+        self.init_ai_core()
         
         # Refresh documents list now that DB is initialized
         self.refresh_documents()
@@ -199,429 +101,67 @@ class DesktopAssistantApp(DesktopAssistantUI):
             # Ensure we're disconnected
             self.disconnect()
 
-    def get_embedding_fn(self):
-        """Returns a lambda that uses current settings for embeddings"""
-        return lambda text: compute_embedding(
-            text, 
-            base_url=self.settings.get("base_url"), 
-            embedding_model=self.settings.get("embedding_model")
-        )
+    def handle_ui_refresh(self, target=None):
+        """Callback for AICore to request UI updates"""
+        if target == 'db':
+            self.root.after(0, self.refresh_database_view)
+        elif target == 'docs':
+            self.root.after(0, self.refresh_documents)
+        else:
+            self.root.after(0, self.refresh_database_view)
+            self.root.after(0, self.refresh_documents)
 
-    def init_brain(self):
-        """Initialize the AI memory and reasoning components"""
+    def init_ai_core(self):
+        """Initialize the AI Core and alias components"""
         try:
-            # Alias: "Da'at" | Function: Knowledge
-            self.memory_store = MemoryStore(db_path="./data/memory.sqlite3")
-            self.meta_memory_store = MetaMemoryStore(
-                db_path="./data/meta_memory.sqlite3",
-                embed_fn=self.get_embedding_fn()
-            )
-            self.document_store = FaissDocumentStore(
-                db_path="./data/documents_faiss.sqlite3",
-                embed_fn=self.get_embedding_fn()
-            )
-            self.reasoning_store = ReasoningStore(embed_fn=self.get_embedding_fn())
-            self.arbiter = MemoryArbiter(self.memory_store, meta_memory_store=self.meta_memory_store, embed_fn=self.get_embedding_fn())
-            self.consolidator = MemoryConsolidator(
-                self.memory_store, 
-                meta_memory_store=self.meta_memory_store, 
-                document_store=self.document_store,
-                consolidation_thresholds=self.settings.get("consolidation_thresholds"),
-                max_inconclusive_attempts=int(self.settings.get("max_inconclusive_attempts", 10)),
-                max_retrieval_failures=int(self.settings.get("max_retrieval_failures", 10))
-            )
-            
-            # Initialize Event Bus
-            self.event_bus = EventBus()
-            
-            # Initialize Daydreamer
-            # Alias: "Chokhmah" | Function: Raw, Creative Output
-            from daydreaming import Daydreamer
-            self.daydreamer = Daydreamer(
-                memory_store=self.memory_store,
-                reasoning_store=self.reasoning_store,
-                arbiter=self.arbiter,
-                document_store=self.document_store,
-                get_settings_fn=lambda: self.settings,
-                log_fn=self.log_to_main,
+            # Wrapper to ensure newlines for internal AI logs (fixes log truncation/merging)
+            def log_with_newline(msg):
+                if msg:
+                    self.log_to_main(f"{msg}\n")
+
+            self.ai_core = AICore(
+                settings_provider=lambda: self.settings,
+                log_fn=log_with_newline,
                 chat_fn=self.on_proactive_message,
-                stop_check_fn=lambda: self.stop_processing_flag,
-                status_fn=lambda msg: self.root.after(0, lambda: self.status_var.set(msg)),
+                status_callback=lambda msg: self.root.after(0, lambda: self.status_var.set(msg)),
+                telegram_status_callback=self.send_telegram_status,
+                ui_refresh_callback=self.handle_ui_refresh,
                 get_chat_history_fn=self.get_current_chat_history,
-                event_bus=self.event_bus
-            )
-
-            # Helper for sync verification in loop (thread-safe UI updates)
-            def verify_batch_sync():
-                if hasattr(self, 'consolidator'):
-                    self.root.after(0, lambda: self.status_var.set("Verifying sources (Decider)..."))
-                    removed = self.consolidator.verify_sources(batch_size=50, stop_check_fn=lambda: self.stop_processing_flag)
-                    if removed > 0:
-                        self.root.after(0, self.refresh_database_view)
-                        self.log_to_main(f"🧹 [Decider] Removed {removed} memories.")
-
-            # Wrappers for Telegram notifications
-            def start_daydream_wrapper():
-                self.send_telegram_status("☁️ Model is processing memories (Daydreaming)...")
-                try:
-                    mode = "auto"
-                    topic = None
-                    if self.decider and hasattr(self.decider, 'daydream_mode'):
-                        mode = self.decider.daydream_mode
-                        topic = getattr(self.decider, 'daydream_topic', None)
-                    self.daydreamer.perform_daydream(mode=mode, topic=topic)
-                finally:
-                    self.send_telegram_status("✅ Processing finished.")
-
-            def verify_batch_wrapper():
-                self.send_telegram_status("⚙️ Model is processing memories (Verification Batch)...")
-                try:
-                    verify_batch_sync()
-                finally:
-                    self.send_telegram_status("✅ Processing finished.")
-
-            def verify_all_wrapper():
-                self.send_telegram_status("⚙️ Model is processing memories (Full Verification)...")
-                try:
-                    if hasattr(self, 'consolidator'):
-                        self.root.after(0, lambda: self.status_var.set("Verifying ALL sources..."))
-                        
-                        last_remaining = -1
-                        stuck_count = 0
-                        
-                        while True:
-                            if self.stop_processing_flag:
-                                break
-                            remaining = self.consolidator.get_unverified_count()
-                            if remaining == 0:
-                                break
-                            
-                            # Loop protection: Break if stuck on the same number of memories
-                            if remaining == last_remaining:
-                                stuck_count += 1
-                                if stuck_count >= 5:
-                                    self.log_to_main(f"⚠️ Verification loop stuck on {remaining} memories. Aborting.")
-                                    break
-                            else:
-                                stuck_count = 0
-                                last_remaining = remaining
-
-                            self.consolidator.verify_sources(batch_size=50, stop_check_fn=lambda: self.stop_processing_flag)
-                            self.root.after(0, self.refresh_database_view)
-                        
-                        if self.hod:
-                            self.hod.perform_analysis("Full Verification")
-                finally:
-                    self.send_telegram_status("✅ Processing finished.")
-
-            def start_loop_wrapper():
-                self.send_telegram_status("🔄 Daydream loop enabled.")
-                self.enable_daydream_loop()
-
-            # Wrappers for Strategic Thinking (Goal Management & Document Access)
-            def remove_goal_wrapper(target):
-                """Allows Decider to remove completed or obsolete goals"""
-                try:
-                    # Fetch all memories to safely check type
-                    all_memories = self.memory_store.list_recent(limit=None)
-                    
-                    target_id = None
-                    try:
-                        target_id = int(str(target).strip())
-                    except ValueError:
-                        pass
-                        
-                    found_items = []
-                    if target_id is not None:
-                        found_items = [m for m in all_memories if m[0] == target_id]
-                    else:
-                        # Search by text content
-                        target_text = str(target).lower()
-                        found_items = [m for m in all_memories if target_text in m[3].lower()]
-                    
-                    removed_count = 0
-                    response_msgs = []
-                    
-                    for item in found_items:
-                        # item structure: (id, type, subject, text, ...)
-                        mem_id = item[0]
-                        mem_type = item[1]
-                        mem_text = item[3]
-                        
-                        if mem_type == "GOAL":
-                            self.memory_store.soft_delete_entry(mem_id)
-                            self.log_to_main(f"🗑️ [Decider] Marked GOAL as inactive: {mem_text}")
-                            response_msgs.append(f"Removed '{mem_text}'")
-                            removed_count += 1
-                        else:
-                            # Protect chat memories and other types
-                            response_msgs.append(f"Skipped ID {mem_id} (Type: {mem_type})")
-                            
-                    if removed_count > 0:
-                        return f"✅ Success. {', '.join(response_msgs)}"
-                    elif response_msgs:
-                        return f"⚠️ Failed. {', '.join(response_msgs)}"
-                    else:
-                        return "❌ No matching goals found."
-                except Exception as e:
-                    return f"❌ Error removing goal: {e}"
-
-            def list_documents_wrapper():
-                """Allows Decider to see available documents for daydreaming topics"""
-                try:
-                    docs = self.document_store.list_documents(limit=50)
-                    if not docs:
-                        return "No documents available."
-                    
-                    lines = ["Available Documents:"]
-                    for doc in docs:
-                        # doc: (id, filename, file_type, page_count, chunk_count, created_at)
-                        lines.append(f"- ID {doc[0]}: {doc[1]} ({doc[4]} chunks)")
-                    return "\n".join(lines)
-                except Exception as e:
-                    return f"Error listing documents: {e}"
-
-            def read_document_wrapper(target):
-                """Allows Decider to read a specific document"""
-                try:
-                    # Try ID first
-                    doc_id = None
-                    try:
-                        doc_id = int(str(target).strip())
-                    except:
-                        pass
-                    
-                    docs = self.document_store.list_documents(limit=1000)
-                    selected_doc = None
-                    
-                    if doc_id:
-                        selected_doc = next((d for d in docs if d[0] == doc_id), None)
-                    
-                    if not selected_doc:
-                        # Try filename match
-                        target_lower = str(target).lower().strip()
-                        selected_doc = next((d for d in docs if target_lower in d[1].lower()), None)
-                        
-                    if not selected_doc:
-                        return f"❌ Document '{target}' not found."
-                        
-                    # Fetch chunks
-                    doc_id = selected_doc[0]
-                    filename = selected_doc[1]
-                    chunks = self.document_store.get_document_chunks(doc_id)
-                    
-                    if not chunks:
-                        return f"⚠️ Document '{filename}' is empty."
-                        
-                    # Return first 5 chunks (Overview)
-                    preview = "\n\n".join([c['text'] for c in chunks[:5]])
-                    return f"📄 Content of '{filename}' (First 5 chunks):\n{preview}"
-                except Exception as e:
-                    return f"❌ Error reading document: {e}"
-
-            def search_memory_wrapper(query):
-                """Allows Decider to actively search memories"""
-                try:
-                    emb = self.get_embedding_fn()(query)
-                    results = self.memory_store.search(emb, limit=10)
-                    if not results:
-                        return "No matching memories found."
-                    
-                    lines = [f"Search results for '{query}':"]
-                    for r in results:
-                        # r: (id, type, subject, text, similarity)
-                        lines.append(f"- [{r[1]}] {r[3]} (Sim: {r[4]:.2f})")
-                    return "\n".join(lines)
-                except Exception as e:
-                    return f"❌ Error searching memory: {e}"
-
-            def prune_memory_wrapper(target_id):
-                """Allows Hod to mark memories for pruning (tagging only)"""
-                try:
-                    mid = int(str(target_id).strip())
-                    mem = self.memory_store.get(mid)
-                    if not mem:
-                        return f"⚠️ Memory ID {mid} not found."
-                    
-                    # Check if already deleted
-                    if mem.get('deleted', 0) == 1:
-                        return f"ℹ️ Memory ID {mid} is already pruned."
-
-                    # Protection check: Do not prune verified daydream memories
-                    is_verified = mem.get('verified', 0) == 1
-                    source = mem.get('source', '').lower()
-                    mem_type = mem.get('type', '').upper()
-                    verification_attempts = mem.get('verification_attempts') or 0
-
-                    if is_verified and 'daydream' in source:
-                        return f"⚠️ Cannot prune verified daydream memory (ID: {mid})."
-
-                    # Protection: Do not prune daydream memories that haven't been verified yet
-                    # EXCEPTION: Allow pruning BELIEFs, as Daydreamer refutation IS the verification for them.
-                    if 'daydream' in source and verification_attempts == 0 and not is_verified and mem_type != "BELIEF":
-                        return f"⚠️ Cannot prune unprocessed daydream memory (ID: {mid}). Let Verifier check it first (unless it's a refuted belief)."
-
-                    # Protect Assistant Notes
-                    if mem_type == "NOTE":
-                        return f"⚠️ Cannot prune Assistant Note (ID: {mid})."
-
-                    # Protect Chat Memories
-                    if source == 'assistant':
-                        return f"⚠️ Cannot prune Chat Memory (ID: {mid})."
-
-                    # Tag instead of delete
-                    if self.memory_store.set_flag(mid, "PRUNE_REQUESTED"):
-                        return f"🏷️ Tagged memory ID {mid} for pruning (Decider must confirm)."
-                    return f"⚠️ Failed to tag memory ID {mid}."
-                except Exception as e:
-                    return f"❌ Error tagging memory: {e}"
-
-            def confirm_prune_wrapper(target_id):
-                """Allows Decider to confirm and execute a prune request"""
-                try:
-                    mid = int(str(target_id).strip())
-                    
-                    # Safety: Verify flag exists
-                    mem = self.memory_store.get(mid)
-                    if not mem or mem.get('flags') != 'PRUNE_REQUESTED':
-                        return f"⚠️ Memory ID {mid} is not flagged for pruning."
-
-                    if self.memory_store.soft_delete_entry(mid):
-                        return f"🗑️ Pruned memory ID {mid}."
-                    return f"⚠️ Memory ID {mid} not found."
-                except Exception as e:
-                    return f"❌ Error confirming prune: {e}"
-
-            def reject_prune_wrapper(target_id):
-                """Allows Decider to reject a prune request (clear tag)"""
-                try:
-                    mid = int(str(target_id).strip())
-                    if self.memory_store.set_flag(mid, None): # Clear flag
-                        return f"✅ Rejected prune for memory ID {mid}."
-                    return f"⚠️ Memory ID {mid} not found."
-                except Exception as e:
-                    return f"❌ Error rejecting prune: {e}"
-
-            def summarize_wrapper():
-                """Allows Decider to trigger Hod's summarization"""
-                if self.hod:
-                    self.hod.run_summarization()
-                    return "🔮 Hod is summarizing the session."
-                return "⚠️ Hod not initialized."
-
-            def consolidate_summaries_wrapper():
-                """Allows Decider to trigger Hod's summary consolidation"""
-                if self.hod:
-                    result = self.hod.consolidate_summaries()
-                    return result
-                return "⚠️ Hod not initialized."
-
-            # Initialize Decider
-            self.decider = Decider(
-                get_settings_fn=lambda: self.settings,
+                get_logs_fn=self.get_recent_main_logs,
+                get_doc_logs_fn=self.get_recent_doc_logs,
+                get_status_text_fn=self.get_current_status_text,
                 update_settings_fn=self.update_settings_from_decider,
-                memory_store=self.memory_store,
-                document_store=self.document_store,
-                reasoning_store=self.reasoning_store,
-                arbiter=self.arbiter,
-                meta_memory_store=self.meta_memory_store,
-                actions={
-                    "start_daydream": start_daydream_wrapper,
-                    "verify_batch": verify_batch_wrapper,
-                    "verify_all": verify_all_wrapper,
-                    "start_loop": start_loop_wrapper,
-                    "stop_daydream": self.stop_daydream,
-                    "run_observer": lambda: self.observer.perform_observation() if self.observer else None,
-                    "run_hod": lambda: self.hod.perform_analysis("Decider Cycle") if self.hod else None,
-                    "remove_goal": remove_goal_wrapper,
-                    "list_documents": list_documents_wrapper,
-                    "read_document": read_document_wrapper,
-                    "search_memory": search_memory_wrapper,
-                    "confirm_prune": confirm_prune_wrapper,
-                    "reject_prune": reject_prune_wrapper,
-                    "summarize": summarize_wrapper,
-                    "consolidate_summaries": consolidate_summaries_wrapper
-                },
-                log_fn=self.log_to_main,
-                chat_fn=self.on_proactive_message,
-                get_chat_history_fn=self.get_current_chat_history,
-                stop_check_fn=lambda: self.stop_processing_flag
-            )
-
-            # Initialize Continuous Observer (Netzach)
-            self.observer = ContinuousObserver(
-                memory_store=self.memory_store,
-                reasoning_store=self.reasoning_store,
-                meta_memory_store=self.meta_memory_store,
-                get_settings_fn=lambda: self.settings,
-                get_chat_history_fn=self.get_current_chat_history,
-                manifest_fn=self.on_proactive_message,
-                get_meta_memories_fn=lambda: self.meta_memory_store.list_recent(limit=10),
-                get_main_logs_fn=self.get_recent_main_logs,
-                get_doc_logs_fn=self.get_recent_doc_logs,
-                get_status_fn=self.get_current_status_text,
-                event_bus=self.event_bus,
-                get_recent_docs_fn=lambda: self.document_store.list_documents(limit=5),
-                log_fn=self.log_to_main,
-                stop_check_fn=lambda: self.stop_processing_flag
+                stop_check_fn=lambda: self.stop_processing_flag,
+                enable_loop_fn=self.enable_daydream_loop,
+                stop_daydream_fn=self.stop_processing,
+                sync_journal_fn=self.sync_journal
             )
             
-            # Initialize Hod (Reflective Analyst)
-            self.hod = Hod(
-                memory_store=self.memory_store,
-                meta_memory_store=self.meta_memory_store,
-                reasoning_store=self.reasoning_store,
-                get_settings_fn=lambda: self.settings,
-                get_main_logs_fn=self.get_recent_main_logs,
-                get_doc_logs_fn=self.get_recent_doc_logs,
-                log_fn=self.log_to_main,
-                event_bus=self.event_bus,
-                prune_memory_fn=prune_memory_wrapper
-            )
+            # Alias components for compatibility
+            self.memory_store = self.ai_core.memory_store
+            self.meta_memory_store = self.ai_core.meta_memory_store
+            self.document_store = self.ai_core.document_store
+            self.reasoning_store = self.ai_core.reasoning_store
+            self.arbiter = self.ai_core.arbiter
+            self.binah = self.ai_core.binah
+            self.event_bus = self.ai_core.event_bus
+            self.keter = self.ai_core.keter
+            self.hesed = self.ai_core.hesed
+            self.gevurah = self.ai_core.gevurah
+            self.hod_force = self.ai_core.hod_force
+            self.netzach_force = self.ai_core.netzach_force
+            self.decider = self.ai_core.decider
+            self.observer = self.ai_core.observer
+            self.hod = self.ai_core.hod
+            self.daat = self.ai_core.daat
+            self.document_processor = self.ai_core.document_processor
+            self.internet_bridge = self.ai_core.internet_bridge
             
-            # --- Event Bus Wiring ---
-            # 1. Netzach -> Decider (Wake up)
-            self.event_bus.subscribe("DECIDER_WAKE", lambda e: self.decider.start_daydream())
+            # Subscribe to AI_SPEAK
+            self.ai_core.event_bus.subscribe("AI_SPEAK", self.on_ai_speak, priority=10)
             
-            # 2. Netzach -> System (Param updates)
-            def handle_param_update(event):
-                data = event.data
-                if "temperature_delta" in data:
-                    self.decider.increase_temperature(data["temperature_delta"])
-                if "temperature_decrease" in data:
-                    self.decider.decrease_temperature(data["temperature_decrease"])
-                if "tokens_delta" in data:
-                    self.decider.increase_tokens(data["tokens_delta"])
-                if "tokens_decrease" in data:
-                    self.decider.decrease_tokens(data["tokens_decrease"])
-            self.event_bus.subscribe("SYSTEM_PARAM_UPDATE", handle_param_update)
-            
-            # 3. Netzach -> Hod (Instruction)
-            self.event_bus.subscribe("HOD_INSTRUCTION", lambda e: self.hod.receive_instruction(e.data) if self.hod else None)
-            
-            # 4. Netzach -> Hod (Summary Request)
-            self.event_bus.subscribe("REQUEST_SUMMARY", lambda e: self.hod.run_summarization() if self.hod else None)
-            
-            # 5. Netzach -> Decider (Observation)
-            self.event_bus.subscribe("DECIDER_OBSERVATION", lambda e: self.decider.receive_observation(e.data))
-
-            # 6. Hod -> Netzach (Wake/Instruction)
-            self.event_bus.subscribe("NETZACH_WAKE", lambda e: self.observer.perform_observation())
-            
-            def handle_netzach_instruction(event):
-                msg = event.data
-                if hasattr(self.meta_memory_store, 'add_event'):
-                    self.meta_memory_store.add_event("HOD_MESSAGE", "Hod", f"Message to Netzach: {msg}")
-                self.observer.perform_observation()
-            self.event_bus.subscribe("NETZACH_INSTRUCTION", handle_netzach_instruction)
-            
-            # Trigger initial analysis to orient the system based on past sessions
-            if self.hod:
-                self.root.after(2000, lambda: threading.Thread(target=self.hod.perform_analysis, args=("System Startup",), daemon=True).start())
-            
-            print("🧠 Brain initialized successfully.")
         except Exception as e:
-            messagebox.showerror("Initialization Error", f"Failed to initialize AI components:\n{e}")
+            messagebox.showerror("Initialization Error", f"Failed to initialize AI Core:\n{e}")
 
     def update_settings_from_decider(self, new_settings: Dict):
         """Callback for Decider to update settings and UI"""
@@ -643,28 +183,16 @@ class DesktopAssistantApp(DesktopAssistantUI):
     def get_recent_main_logs(self) -> str:
         """Get last 15 lines of main logs for Netzach"""
         if hasattr(self, 'log_buffer'):
-            full_text = "".join(self.log_buffer)
+            full_text = "".join([str(x) for x in self.log_buffer if x is not None])
             lines = full_text.splitlines()
             return "\n".join(lines[-15:])
-        
-        if not hasattr(self, 'main_log_text'): return ""
-        try:
-            content = self.main_log_text.get("end-15l", "end-1c")
-            return content.strip()
-        except:
-            return ""
+        return ""
 
     def get_recent_doc_logs(self) -> str:
         """Get last 10 lines of document logs for Netzach"""
         if hasattr(self, 'debug_log_buffer'):
             return "".join(self.debug_log_buffer[-10:])
-            
-        if not hasattr(self, 'debug_log'): return ""
-        try:
-            content = self.debug_log.get("end-10l", "end-1c")
-            return content.strip()
-        except:
-            return ""
+        return ""
 
     def get_current_status_text(self) -> str:
         """Get current status bar text for Netzach"""
@@ -743,6 +271,11 @@ class DesktopAssistantApp(DesktopAssistantUI):
                 history = history[-20:]
             self.chat_memory[chat_id] = history
 
+    def on_ai_speak(self, event):
+        """Handle proactive AI speech events"""
+        message = event.data
+        self.root.after(0, lambda: self.on_proactive_message("Assistant (Insight)", message))
+
     def stop_processing(self):
         """Stop current AI generation"""
         print("🛑 Stop button clicked.")
@@ -782,18 +315,11 @@ class DesktopAssistantApp(DesktopAssistantUI):
             messagebox.showinfo("Busy", "AI is currently busy processing a task.")
             return
             
-        if self.daydreamer:
-            def run_with_lock():
-                with self.processing_lock:
-                    self.is_processing = True
-                    try:
-                        self.daydreamer.perform_daydream()
-                    finally:
-                        self.is_processing = False
-                        self.root.after(0, lambda: self.status_var.set("Ready"))
-            threading.Thread(target=run_with_lock, daemon=True).start()
+        if self.decider:
+            self.decider.start_daydream()
+            # The background loop will pick this up
         else:
-            messagebox.showerror("Error", "Daydreamer not initialized.")
+            messagebox.showerror("Error", "Decider not initialized.")
 
     def verify_memory_sources(self):
         """Manually trigger memory source verification"""
@@ -802,7 +328,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
             messagebox.showinfo("Busy", "AI is currently busy (e.g. Daydreaming). Please click 'Stop' or enable 'Chat Mode' first.")
             return
             
-        if not hasattr(self, 'consolidator'):
+        if not hasattr(self, 'hod'):
             return
 
         def verify_thread():
@@ -816,13 +342,14 @@ class DesktopAssistantApp(DesktopAssistantUI):
                     if self.stop_processing_flag:
                         return
 
-                    removed = self.consolidator.verify_sources(batch_size=50, stop_check_fn=lambda: self.stop_processing_flag)
+                    concurrency = int(self.settings.get("concurrency", 4))
+                    removed = self.hod.verify_sources(batch_size=50, concurrency=concurrency, stop_check_fn=lambda: self.stop_processing_flag)
                     msg = f"Verification complete. Removed {removed} hallucinated memories."
                     print(f"🧹 [Manual Verifier] {msg}")
                     self.root.after(0, lambda: messagebox.showinfo("Verification Result", msg))
                     self.root.after(0, self.refresh_database_view)
                     if self.hod:
-                        self.hod.perform_analysis("Verification Batch")
+                        self.hod.reflect("Verification Batch")
                 except Exception as e:
                     print(f"Verification error: {e}")
                     self.root.after(0, lambda: messagebox.showerror("Error", f"Verification failed: {e}"))
@@ -838,7 +365,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
             messagebox.showinfo("Busy", "AI is currently busy. Please click 'Stop' first.")
             return
             
-        if not hasattr(self, 'consolidator'):
+        if not hasattr(self, 'hod'):
             return
 
         def verify_all_thread():
@@ -858,7 +385,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
                             break
                         
                         # Check if anything left to verify
-                        remaining = self.consolidator.get_unverified_count()
+                        remaining = self.hod.get_unverified_count()
                         if remaining == 0:
                             print("✅ All cited memories verified.")
                             break
@@ -876,7 +403,8 @@ class DesktopAssistantApp(DesktopAssistantUI):
                         self.root.after(0, lambda: self.status_var.set(f"Verifying... ({remaining} left)"))
                         
                         # Verify a batch
-                        removed = self.consolidator.verify_sources(batch_size=10000, stop_check_fn=lambda: self.stop_processing_flag)
+                        concurrency = int(self.settings.get("concurrency", 4))
+                        removed = self.hod.verify_sources(batch_size=10000, concurrency=concurrency, stop_check_fn=lambda: self.stop_processing_flag)
                         total_removed += removed
                         
                         # Refresh UI to show progress
@@ -886,7 +414,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
                     print(f"🧹 [Manual Verifier] {msg}")
                     self.root.after(0, lambda: messagebox.showinfo("Verification Result", msg))
                     if self.hod:
-                        self.hod.perform_analysis("Full Verification")
+                        self.hod.reflect("Full Verification")
                 except Exception as e:
                     print(f"Verification error: {e}")
                     self.root.after(0, lambda: messagebox.showerror("Error", f"Verification failed: {e}"))
@@ -951,7 +479,17 @@ class DesktopAssistantApp(DesktopAssistantUI):
                 self.status_var.set("Connected to Telegram")
 
                 # Start message polling
-                threading.Thread(target=self.poll_telegram_messages, daemon=True).start()
+                threading.Thread(
+                    target=self.telegram_bridge.listen,
+                    kwargs={
+                        "on_text": self.handle_telegram_text,
+                        "on_document": lambda m: threading.Thread(target=self.handle_telegram_document, args=(m,), daemon=True).start(),
+                        "on_photo": self.handle_telegram_photo,
+                        "running_check": lambda: self.is_connected() and self.settings.get("telegram_bridge_enabled", False),
+                        "start_timestamp": self.start_time
+                    },
+                    daemon=True
+                ).start()
 
             else:
                 raise Exception("Failed to send test message")
@@ -989,461 +527,13 @@ class DesktopAssistantApp(DesktopAssistantUI):
 
     def handle_command(self, text: str, chat_id: int) -> Optional[str]:
         """Process slash commands and return response if matched"""
-        cmd_parts = text.strip().split()
-        if not cmd_parts:
-            return None
-        
-        cmd = cmd_parts[0].lower()
-
-        # Confirmation handling
-        if cmd == "/y":
-            if self.pending_confirmation_command:
-                pending_cmd = self.pending_confirmation_command
-                self.pending_confirmation_command = None
-                
-                if pending_cmd in self.RESET_CHAT:
-                    self.chat_memory[chat_id] = []
-                    return "♻️ Chat history cleared."
-
-                if pending_cmd in self.RESET_MEMORY:
-                    self.memory_store.clear()
-                    return "🧠 Long-term memory wiped."
-                    
-                if pending_cmd in self.RESET_REASONING:
-                    self.reasoning_store.clear()
-                    return "🧩 Reasoning buffer cleared."
-
-                if pending_cmd in self.RESET_META_MEMORY:
-                    self.meta_memory_store.clear()
-                    return "🧠 Meta-memories cleared."
-
-                if pending_cmd in self.RESET_ALL:
-                    self.chat_memory[chat_id] = []
-                    self.reasoning_store.clear()
-                    self.memory_store.clear()
-                    self.meta_memory_store.clear()
-                    return "🔥 Full reset complete (chat + reasoning + memory + meta-memory)."
-            else:
-                return "ℹ️ No pending command to confirm."
-
-        # Reset Commands (Initiate confirmation)
-        if cmd in self.RESET_CHAT or cmd in self.RESET_MEMORY or cmd in self.RESET_REASONING or cmd in self.RESET_META_MEMORY or cmd in self.RESET_ALL:
-            self.pending_confirmation_command = cmd
-            return "⚠️ Are you sure? This action is irreversible. Type `/Y` to confirm."
-
-        # Clear pending confirmation if another command is issued
-        self.pending_confirmation_command = None
-
-        # Consolidation
-        if cmd in {"/consolidate", "/consolidatenow"}:
-            def run_consolidation():
-                self.log_to_main("🧠 Starting manual consolidation...")
-                stats = self.consolidator.consolidate(time_window_hours=None)
-                msg = f"🧠 Consolidation complete: Processed {stats['processed']}, Consolidated {stats['consolidated']}, Skipped {stats['skipped']}."
-                self.log_to_main(msg)
-                self.root.after(0, lambda: self.add_chat_message("System", msg, "incoming"))
-                self.root.after(0, self.refresh_database_view)
-            
-            threading.Thread(target=run_consolidation, daemon=True).start()
-            return "⏳ Consolidation started in background..."
-
-        # Memory Removal
-        if cmd in self.REMOVE_IDENTITY:
-            count = self.memory_store.clear_by_type("IDENTITY")
-            return f"🗑️ Removed {count} IDENTITY memories."
-        
-        if cmd in self.REMOVE_FACT:
-            count = self.memory_store.clear_by_type("FACT")
-            return f"🗑️ Removed {count} FACT memories."
-            
-        if cmd in self.REMOVE_PREFERENCE:
-            count = self.memory_store.clear_by_type("PREFERENCE")
-            return f"🗑️ Removed {count} PREFERENCE memories."
-            
-        if cmd in self.REMOVE_GOAL:
-            count = self.memory_store.clear_by_type("GOAL")
-            return f"🗑️ Removed {count} GOAL memories."
-            
-        if cmd in self.REMOVE_BELIEF:
-            count = self.memory_store.clear_by_type("BELIEF")
-            return f"🗑️ Removed {count} BELIEF memories."
-            
-        if cmd in self.REMOVE_PERMISSION:
-            count = self.memory_store.clear_by_type("PERMISSION")
-            return f"🗑️ Removed {count} PERMISSION memories."
-            
-        if cmd in self.REMOVE_RULE:
-            count = self.memory_store.clear_by_type("RULE")
-            return f"🗑️ Removed {count} RULE memories."
-
-        # Document Management
-        if cmd in self.DOCUMENT_LIST:
-            docs = self.document_store.list_documents(limit=20)
-            if not docs:
-                return "📚 No documents in the database."
-            
-            lines = []
-            for doc_id, filename, file_type, page_count, chunk_count, created_at in docs:
-                date_str = datetime.fromtimestamp(created_at).strftime("%Y-%m-%d %H:%M")
-                page_info = f", {page_count} pages" if page_count else ""
-                lines.append(f"📄 {filename} ({file_type}{page_info}, {chunk_count} chunks) - {date_str}")
-            
-            return "📚 Document Database:\n" + "\n".join(lines)
-
-        if cmd in self.DOCUMENT_REMOVE:
-            # Extract filename
-            match = re.search(r'"([^"]*)"', text)
-            if match:
-                doc_filename = match.group(1)
-                # Find doc ID
-                docs = self.document_store.list_documents(limit=1000)
-                doc_id = next((d[0] for d in docs if d[1] == doc_filename), None)
-                
-                if doc_id:
-                    if self.document_store.delete_document(doc_id):
-                        # Refresh GUI if open
-                        self.root.after(0, self.refresh_documents)
-                        return f"🗑️ Successfully removed document: {doc_filename}"
-                    else:
-                        return f"❌ Could not remove document: {doc_filename}"
-                else:
-                    return f"❌ Document not found: {doc_filename}"
-            else:
-                return "🗑️ To remove a document, use: /RemoveDoc \"filename.pdf\"\nUse /Documents to see available documents."
-
-        if cmd in self.DOCUMENT_CONTENT or any(text.lower().startswith(x) for x in self.DOCUMENT_CONTENT):
-             # Extract filename
-            match = re.search(r'"([^"]*)"', text)
-            if match:
-                doc_filename = match.group(1)
-                # Find doc ID
-                docs = self.document_store.list_documents(limit=1000)
-                doc_id = next((d[0] for d in docs if d[1] == doc_filename), None)
-                
-                if doc_id:
-                    chunks = self.document_store.get_document_chunks(doc_id)
-                    if chunks:
-                        preview = "\n\n".join([f"Chunk {c['chunk_index']+1}: {c['text'][:200]}..." for c in chunks[:3]])
-                        return f"📖 Content preview for '{doc_filename}':\n\n{preview}"
-                    return f"❌ No content found for: {doc_filename}"
-                return f"❌ Document not found: {doc_filename}"
-            else:
-                return "📖 To view document content, use: /DocContent \"filename.pdf\"\nUse /Documents to see available documents."
-
-        # Memories View
-        if cmd == "/memories":
-            items = self.memory_store.list_recent(limit=None)
-            if not items:
-                return "🧠 No saved memories."
-            
-            type_emoji = {
-                "IDENTITY": "👤", "FACT": "📌", "PREFERENCE": "❤️", 
-                "GOAL": "🎯", "RULE": "⚖️", "PERMISSION": "✅", "BELIEF": "💭"
-            }
-            
-            grouped = {}
-            for (_id, mem_type, subject, text) in items:
-                _id, mem_type, subject, text = item[:4]
-                grouped.setdefault(mem_type, []).append((subject, text))
-            
-            lines = []
-            hierarchy = ["PERMISSION", "RULE", "IDENTITY", "PREFERENCE", "GOAL", "FACT", "BELIEF"]
-            
-            for mem_type in hierarchy:
-                if mem_type in grouped:
-                    emoji = type_emoji.get(mem_type, "💡")
-                    lines.append(f"\n{emoji} {mem_type}:")
-                    for subject, text in grouped[mem_type]:
-                        lines.append(f"  - [{subject}] {text}")
-                    del grouped[mem_type]
-            
-            for mem_type, remaining in grouped.items():
-                emoji = type_emoji.get(mem_type, "💡")
-                lines.append(f"\n{emoji} {mem_type}:")
-                for subject, text in remaining:
-                    lines.append(f"  - [{subject}] {text}")
-            
-            return "🧠 Saved Memories :\n" + "\n".join(lines)
-
-        # Meta Memories View
-        if cmd in {"/metamemories", "/meta-memories"}:
-            items = self.meta_memory_store.list_recent(limit=30)
-            if not items:
-                return "🧠 No meta-memories."
-            
-            lines = []
-            for (_id, event_type, subject, text, created_at) in items:
-                event_emoji = {
-                    "MEMORY_CREATED": "✨", "VERSION_UPDATE": "🔄",
-                    "CONFLICT_DETECTED": "⚠️", "CONSOLIDATION": "🔗"
-                }.get(event_type, "🧠")
-                lines.append(f"{event_emoji} [{subject}] {text}")
-            
-            return "🧠 Meta-Memories (Reflections):\n" + "\n".join(lines)
-
-        # Chat Memories View
-        if cmd in {"/chatmemories", "/chatmemory"}:
-            items = self.memory_store.list_recent(limit=None)
-            if not items:
-                return "🧠 No saved memories."
-            
-            # Filter out daydream memories
-            chat_items = [item for item in items if len(item) >= 5 and item[4] != 'daydream']
-            
-            if not chat_items:
-                return "🧠 No chat memories found."
-
-            type_emoji = {
-                "IDENTITY": "👤", "FACT": "📌", "PREFERENCE": "❤️", 
-                "GOAL": "🎯", "RULE": "⚖️", "PERMISSION": "✅", "BELIEF": "💭"
-            }
-            
-            grouped = {}
-            for item in chat_items:
-                _id, mem_type, subject, text = item[:4]
-                grouped.setdefault(mem_type, []).append((subject, text))
-            
-            lines = []
-            hierarchy = ["PERMISSION", "RULE", "IDENTITY", "PREFERENCE", "GOAL", "FACT", "BELIEF"]
-            
-            for mem_type in hierarchy:
-                if mem_type in grouped:
-                    emoji = type_emoji.get(mem_type, "💡")
-                    lines.append(f"\n{emoji} {mem_type}:")
-                    for subject, text in grouped[mem_type]:
-                        lines.append(f"  - [{subject}] {text}")
-                    del grouped[mem_type]
-            
-            for mem_type, remaining in grouped.items():
-                emoji = type_emoji.get(mem_type, "💡")
-                lines.append(f"\n{emoji} {mem_type}:")
-                for subject, text in remaining:
-                    lines.append(f"  - [{subject}] {text}")
-            
-            return "🧠 Chat Memories (No Daydreams):\n" + "\n".join(lines)
-
-        # Assistant Notes (formerly Special Memories)
-        if cmd in {"/note", "/notes", "/specialmemory"}:
-            # If arguments provided, create note
-            if len(cmd_parts) > 1:
-                content = text[len(cmd_parts[0]):].strip()
-                if self.decider:
-                    self.decider.create_note(content)
-                    return f"📝 Note created: {content}"
-                else:
-                    return "❌ Decider not initialized."
-            
-            # List notes
-            items = self.memory_store.list_recent(limit=None)
-            if not items:
-                return "🧠 No saved memories."
-            
-            notes = [item for item in items if item[1] == "NOTE"]
-            
-            if not notes:
-                return "📝 No assistant notes found."
-            
-            lines = []
-            for item in notes:
-                # item: (id, type, subject, text, source, verified)
-                _id, mem_type, subject, text = item[:4]
-                lines.append(f"📝 [ID:{_id}] {text}")
-            
-            return "📝 Assistant Notes:\n" + "\n".join(lines)
-
-        if cmd in {"/clearnotes", "/clearspecialmemory"}:
-            items = self.memory_store.list_recent(limit=None)
-            count = 0
-            for item in items:
-                if item[1] == "NOTE":
-                    if self.memory_store.delete_entry(item[0]):
-                        count += 1
-            return f"📝 Cleared {count} notes."
-
-        # Remove Summaries
-        if cmd in {"/removesummaries", "/clearsummaries", "/deletesummaries"}:
-            if not self.meta_memory_store:
-                return "❌ Meta-memory store not initialized."
-            
-            count_summary = self.meta_memory_store.delete_by_event_type("SESSION_SUMMARY")
-            count_analysis = self.meta_memory_store.delete_by_event_type("HOD_ANALYSIS")
-            total = count_summary + count_analysis
-            
-            # Refresh UI if needed
-            self.root.after(0, self.refresh_database_view)
-            
-            return f"🗑️ Removed {total} summaries ({count_summary} session summaries, {count_analysis} Hod analyses)."
-
-        # Consolidate Summaries
-        if cmd in {"/consolidatesummaries", "/compresssummaries"}:
-            if not self.hod:
-                return "❌ Hod not initialized."
-            
-            result = self.hod.consolidate_summaries()
-            self.root.after(0, self.refresh_database_view)
-            return result
-
-        # Status
-        if cmd == "/status":
-            status_msg = "📊 **System Status**\n\n"
-            status_msg += f"🔌 Telegram Bridge: {'Connected' if self.is_connected() else 'Disconnected'}\n"
-            
-            cycle_limit = int(self.settings.get("daydream_cycle_limit", 15))
-            cycle_info = f"(Cycle {self.daydream_cycle_count}/{cycle_limit})"
-            
-            status_msg += f"🤖 AI Mode: {'🔒 Chat Mode (Daydream Paused)' if self.chat_mode_var.get() else '☁️ Daydream Mode (Active)'} {cycle_info}\n"
-            status_msg += f"⚙️ Processing: {'⏳ Busy' if self.is_processing else '✅ Idle'}\n"
-            status_msg += f"📚 Knowledge Base: {self.document_store.get_total_documents()} files ({self.document_store.get_total_chunks()} chunks)\n"
-            
-            mem_items = self.memory_store.list_recent(limit=None)
-            verified_count = sum(1 for item in mem_items if len(item) > 5 and item[5] == 1)
-            status_msg += f"🧠 Memory: {len(mem_items)} active nodes ({verified_count} verified)\n"
-            return status_msg
-
-        # Memory Statistics
-        if cmd in {"/memorystatistics", "/memorystats"}:
-            items = self.memory_store.list_recent(limit=None)
-            if not items: return "📊 Memory is empty."
-            
-            by_type = {}
-            by_source = {}
-            verified_count = 0
-            for item in items:
-                mtype, source, is_verified = item[1], item[4], (item[5] if len(item) > 5 else 0)
-                by_type[mtype] = by_type.get(mtype, 0) + 1
-                by_source[source] = by_source.get(source, 0) + 1
-                if is_verified: verified_count += 1
-            
-            stats = f"📊 **Memory Statistics**\n\n**Total:** {len(items)}\n**Verified:** {verified_count} ({verified_count/len(items)*100:.1f}%)\n\n**By Type:**\n" + "\n".join([f"- {t}: {c}" for t, c in sorted(by_type.items(), key=lambda x: x[1], reverse=True)]) + "\n\n**By Source:**\n" + "\n".join([f"- {s}: {c}" for s, c in sorted(by_source.items(), key=lambda x: x[1], reverse=True)])
-            return stats
-
-        # Exit Chat Mode
-        if cmd == "/exitchatmode":
-            if self.chat_mode_var.get():
-                self.chat_mode_var.set(False)
-                self.on_chat_mode_toggle()
-                return "🔓 Chat Mode disabled. Daydreaming will resume shortly."
-            return "ℹ️ Chat Mode is already disabled."
-
-        # Daydream Status
-        if cmd in {"/daydreamstatus", "/ddstatus"}:
-            cycle_limit = int(self.settings.get("daydream_cycle_limit", 15))
-            status_msg = "☁️ **Daydream Status**\n\n"
-            
-            if self.chat_mode_var.get():
-                status_msg += "🚫 State: Paused (Chat Mode Active)\n"
-            elif not self.daydreamer:
-                status_msg += "❌ State: Not Initialized\n"
-            else:
-                status_msg += f"✅ State: {'Processing' if self.is_processing else 'Active (Idle loop)'}\n"
-                
-            status_msg += f"🔄 Cycle Progress: {self.daydream_cycle_count} / {cycle_limit}\n"
-            return status_msg
-
-        # Verification
-        if cmd in {"/verifysources", "/verify"}:
-            self.root.after(1000, self.verify_memory_sources)
-            return "🕵️ Source verification scheduled."
-
-        if cmd in {"/verifyall", "/verifyallsources"}:
-            self.root.after(1000, self.verify_all_memory_sources)
-            return "🕵️ Full verification loop scheduled."
-
-        if cmd == "/stop":
-            self.stop_processing()
-            return "🛑 All processing stopped."
-
-        if cmd in {"/stopverifying", "/stopverify"}:
-            self.stop_processing()
-            return "🛑 Verification stopped."
-            
-        if cmd == "/terminate_desktop":
-            self.root.after(1000, self.root.destroy)
-            return "👋 Shutting down desktop assistant..."
-
-        # Decider Commands
-        if cmd == "/decider":
-            if len(cmd_parts) < 2:
-                return "🤖 Decider Usage: /decider [up|down|daydream|verify|verifyall|loop|stopdaydream]"
-            
-            action = cmd_parts[1].lower()
-            if not self.decider:
-                return "❌ Decider not initialized."
-
-            if action == "up":
-                self.decider.increase_temperature()
-                return "🌡️ Temperature increased."
-            elif action == "down":
-                self.decider.decrease_temperature()
-                return "🌡️ Temperature decreased."
-            elif action == "daydream":
-                self.decider.start_daydream()
-                return "☁️ Daydream triggered."
-            elif action == "verify":
-                self.decider.start_verification_batch()
-                return "🕵️ Verification triggered."
-            elif action == "verifyall":
-                self.decider.verify_all()
-                return "🕵️ Full verification triggered."
-            elif action == "loop":
-                self.decider.start_daydream_loop()
-                return "🔄 Daydream loop enabled."
-            elif action == "stopdaydream":
-                self.decider.stop_daydream()
-                return "🛑 Daydream stopped."
-            else:
-                return f"❌ Unknown decider action: {action}"
-
-        # List Commands
-        if cmd in {"/listcommands", "/help", "/commands"}:
-            return (
-                "🛠️ **Command List**\n\n"
-                "**System:**\n"
-                "• `/Status` - Show system state\n"
-                "• `/DaydreamStatus` - Show daydream cycle info\n"
-                "• `/ExitChatMode` - Resume daydreaming\n\n"
-                "• `/Disrupt` - Interrupt current loop (Telegram only)\n"
-                "• `/Stop` - Stop ALL processing (Chat, Docs, Verify)\n"
-                "• `/StopVerifying` - Stop verification loop\n"
-                "• `/Terminate_Desktop` - Close application\n\n"
-                
-                "**Memory:**\n"
-                "• `/Memories` - Show all memories\n"
-                "• `/ChatMemories` - Show chat memories\n"
-                "• `/MetaMemories` - Show memory logs\n"
-                "• `/MemoryStats` - Show memory counts\n"
-                "• `/Consolidate` - Merge duplicates\n"
-                "• `/SpecialMemories` - Show special memories\n"
-                "• `/SpecialMemory [text]` - Add special memory\n"
-                "• `/ClearSpecialMemory` - Clear all special memories\n"
-                "• `/Verify` - Verify sources (batch)\n"
-                "• `/VerifyAll` - Verify all sources\n\n"
-                
-                "**Docs:**\n"
-                "• `/Documents` - List files\n"
-                "• `/DocContent \"file\"` - Read file\n"
-                "• `/RemoveDoc \"file\"` - Delete file\n\n"
-                
-                "**Cleanup:**\n"
-                "• `/ResetChat` - Clear chat\n"
-                "• `/ResetMemory` - Wipe DB\n"
-                "• `/Remove[Type]` - Delete type (e.g. /RemoveGoal)"
-            )
-
-        return None
+        return process_command_logic(self, text, chat_id)
 
     def send_message(self, event=None):
         """Send message to both local chat and Telegram"""
         message = self.message_entry.get().strip()
         if not message:
             return
-
-        # Interrupt background tasks if running (Local Disrupt)
-        if self.is_processing:
-             self.stop_processing_flag = True
-             if self.decider:
-                 self.decider.report_forced_stop()
-             print("🛑 Local user message triggered disruption.")
 
         # Add to local chat UI immediately
         self.add_chat_message("You", message, "outgoing")
@@ -1470,13 +560,6 @@ class DesktopAssistantApp(DesktopAssistantUI):
         # Clear entry
         self.message_entry.delete(0, tk.END)
 
-        # Interrupt background tasks if running (Local Disrupt)
-        if self.is_processing:
-             self.stop_processing_flag = True
-             if self.decider:
-                 self.decider.report_forced_stop()
-             print("🛑 Local user image triggered disruption.")
-
         # Create a temp copy to avoid deleting the user's original file
         temp_dir = "./data/temp_uploads"
         os.makedirs(temp_dir, exist_ok=True)
@@ -1501,14 +584,6 @@ class DesktopAssistantApp(DesktopAssistantUI):
         """
         # Check for non-locking commands (read-only) to avoid waiting for processing lock
         cmd = user_text.strip().split()[0].lower() if user_text.strip() else ""
-        NON_LOCKING_COMMANDS = {
-            "/status", "/daydreamstatus", "/ddstatus", 
-            "/memories", "/chatmemories", "/chatmemory", "/metamemories", "/meta-memories", 
-            "/memorystats", "/memorystatistics", 
-            "/documents", "/docs", "/listdocs", 
-            "/listcommands", "/help", "/commands",
-            "/specialmemories"
-        }
         
         if cmd in NON_LOCKING_COMMANDS:
             try:
@@ -1526,23 +601,14 @@ class DesktopAssistantApp(DesktopAssistantUI):
                 print(f"Error executing non-locking command: {e}")
             return
 
-        # Acquire lock to ensure mutual exclusion with Daydream/Verification loops
-        with self.processing_lock:
-            self.is_processing = True
+        # Use chat_lock to serialize chat messages, but allow concurrency with Daydream (processing_lock)
+        with self.chat_lock:
             self.stop_processing_flag = False
             
             try:
                 # Determine Chat ID (Local uses 0 or configured ID, Telegram uses actual ID)
                 chat_id = telegram_chat_id if telegram_chat_id else int(self.settings.get("chat_id", 0) or 0)
                 
-                # Inactivity Reset Check
-                now = time.time()
-                last = self.last_activity.get(chat_id)
-                if last and (now - last) > self.INACTIVITY_RESET_SECONDS:
-                    self.chat_memory[chat_id] = []
-                    print(f"♻️ Chat history cleared due to inactivity for chat {chat_id}")
-                self.last_activity[chat_id] = now
-
                 if self.stop_processing_flag:
                     return
 
@@ -1587,6 +653,9 @@ class DesktopAssistantApp(DesktopAssistantUI):
                 if self.stop_processing_flag:
                     return
 
+                # Execute tools inside the response
+                reply = self.ai_core._process_tool_calls(reply)
+
                 # Update History
                 history.append({"role": "assistant", "content": reply})
                 self.chat_memory[chat_id] = history
@@ -1596,7 +665,8 @@ class DesktopAssistantApp(DesktopAssistantUI):
 
                 # Now that the user has their reply, let the Decider think about what's next.
                 if self.decider:
-                    self.decider.run_post_chat_decision_cycle()
+                    # Run in background thread to avoid blocking the chat lock for the next message
+                    threading.Thread(target=self.decider.run_post_chat_decision_cycle, daemon=True).start()
 
                 # Send to Telegram if applicable
                 if self.is_connected() and self.settings.get("telegram_bridge_enabled", False) and self.chat_mode_var.get():
@@ -1614,9 +684,9 @@ class DesktopAssistantApp(DesktopAssistantUI):
                 self.root.after(0, lambda: self.add_chat_message("System", f"Error: {error_msg}", "incoming"))
             finally:
                 # Do not delete image_path here, as UI needs it for display/click
-                self.is_processing = False
                 self.stop_processing_flag = False
-                self.root.after(0, lambda: self.status_var.set("Ready"))
+                if not self.is_processing:
+                    self.root.after(0, lambda: self.status_var.set("Ready"))
 
     def handle_telegram_document(self, msg: Dict):
         """Handle document upload from Telegram"""
@@ -1626,7 +696,6 @@ class DesktopAssistantApp(DesktopAssistantUI):
             file_name = file_info.get("file_name", "unknown_file")
             file_size = file_info.get("file_size", 0)
             chat_id = msg["chat_id"]
-            bot_token = self.settings.get("bot_token")
 
             # Check supported types
             if not file_name.lower().endswith(('.pdf', '.docx')):
@@ -1636,7 +705,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
             self.telegram_bridge.send_message(f"📄 Received {file_name}, processing...")
 
             # Get file path from Telegram
-            file_data = get_file(bot_token, file_id)
+            file_data = self.telegram_bridge.get_file_info(file_id)
             telegram_file_path = file_data["file_path"]
 
             # Download
@@ -1644,7 +713,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
             os.makedirs(local_dir, exist_ok=True)
             local_file_path = os.path.join(local_dir, file_name)
             
-            download_file(bot_token, telegram_file_path, local_file_path)
+            self.telegram_bridge.download_file(telegram_file_path, local_file_path)
 
             # Check duplicates
             file_hash = self.document_store.compute_file_hash(local_file_path)
@@ -1700,74 +769,48 @@ class DesktopAssistantApp(DesktopAssistantUI):
             
         threading.Thread(target=reset_flag, daemon=True).start()
 
-    def poll_telegram_messages(self):
-        """Poll for new messages from Telegram"""
-        while self.is_connected() and self.settings.get("telegram_bridge_enabled", False):
-            try:
-                messages = self.telegram_bridge.get_messages()
-                for msg in messages:
-                    # Ignore old messages (prevent death loop from stuck commands)
-                    if msg.get("date", 0) < self.start_time:
-                        print(f"⚠️ Ignoring old message from {msg.get('from')}: {msg.get('text', 'doc')}")
-                        continue
+    def handle_telegram_text(self, msg: Dict):
+        """Handle text message from Telegram"""
+        # Reset status suppression on interaction
+        self.telegram_status_sent = False
 
-                    if msg["type"] == "text":
-                        # Reset status suppression on interaction
-                        self.telegram_status_sent = False
+        # Check for disrupt command OR implicit disrupt on any message
+        text_content = msg.get("text", "").strip().lower()
+        is_explicit_disrupt = text_content == "/disrupt"
+        
+        if is_explicit_disrupt:
+            self.handle_disrupt_command(msg["chat_id"])
+            return
 
-                        # Check for disrupt command OR implicit disrupt on any message
-                        text_content = msg.get("text", "").strip().lower()
-                        is_explicit_disrupt = text_content == "/disrupt"
-                        
-                        if is_explicit_disrupt or self.is_processing:
-                            self.handle_disrupt_command(msg["chat_id"])
-                            if is_explicit_disrupt:
-                                continue
+        # Show in UI
+        self.root.after(0, lambda m=msg: self.add_chat_message(m["from"], m["text"], "incoming"))
+        # Process logic
+        threading.Thread(
+            target=self.process_message_thread, 
+            args=(msg["text"], False, msg["chat_id"]), # Use actual chat_id from msg
+            daemon=True
+        ).start()
 
-                        # Show in UI
-                        self.root.after(0, lambda m=msg: self.add_chat_message(m["from"], m["text"], "incoming"))
-                        # Process logic
-                        threading.Thread(
-                            target=self.process_message_thread, 
-                            args=(msg["text"], False, msg["chat_id"]), # Use actual chat_id from msg
-                            daemon=True
-                        ).start()
-                    elif msg["type"] == "document":
-                        # Handle document in background
-                        threading.Thread(
-                            target=self.handle_telegram_document,
-                            args=(msg,),
-                            daemon=True
-                        ).start()
-                    elif msg["type"] == "photo":
-                        # Handle photo
-                        try:
-                            # Interrupt if processing (Implicit Disrupt)
-                            if self.is_processing:
-                                self.handle_disrupt_command(msg["chat_id"])
-
-                            file_id = msg["photo"]["file_id"]
-                            caption = msg.get("caption", "") or "Analyze this image."
-                            
-                            # Download to temp
-                            temp_path = f"./data/temp_img_{file_id}.jpg"
-                            file_data = get_file(self.settings.get("bot_token"), file_id)
-                            download_file(self.settings.get("bot_token"), file_data["file_path"], temp_path)
-                            
-                            self.root.after(0, lambda m=msg, c=caption, p=temp_path: self.add_chat_message(m["from"], c, "incoming", image_path=p))
-                            
-                            threading.Thread(
-                                target=self.process_message_thread,
-                                args=(caption, False, msg["chat_id"], temp_path),
-                                daemon=True
-                            ).start()
-                        except Exception as e:
-                            print(f"Error handling photo: {e}")
-
-                time.sleep(0.01)  # Poll every 0.01 seconds
-            except Exception as e:
-                print(f"Error polling messages: {e}")
-                time.sleep(1)  # Wait longer on error
+    def handle_telegram_photo(self, msg: Dict):
+        """Handle photo from Telegram"""
+        try:
+            file_id = msg["photo"]["file_id"]
+            caption = msg.get("caption", "") or "Analyze this image."
+            
+            # Download to temp
+            temp_path = f"./data/temp_img_{file_id}.jpg"
+            file_data = self.telegram_bridge.get_file_info(file_id)
+            self.telegram_bridge.download_file(file_data["file_path"], temp_path)
+            
+            self.root.after(0, lambda m=msg, c=caption, p=temp_path: self.add_chat_message(m["from"], c, "incoming", image_path=p))
+            
+            threading.Thread(
+                target=self.process_message_thread,
+                args=(caption, False, msg["chat_id"], temp_path),
+                daemon=True
+            ).start()
+        except Exception as e:
+            print(f"Error handling photo: {e}")
 
     def upload_documents(self):
         """Upload documents via GUI"""
@@ -1856,19 +899,45 @@ class DesktopAssistantApp(DesktopAssistantUI):
         
         while True:
             try:
-                if hasattr(self, 'consolidator'):
-                    stats = self.consolidator.consolidate(time_window_hours=None)
+                if hasattr(self, 'memory_store'):
+                     self.memory_store.sanitize_sources()
+
+                if hasattr(self, 'binah'):
+                    stats = self.binah.consolidate(time_window_hours=None)
                     if stats['processed'] > 0:
                         print(f"🧠 [Consolidator] Processed: {stats['processed']}, Consolidated: {stats['consolidated']}, Skipped: {stats['skipped']}")
+                        
+                        # Learn associations after consolidation
+                        if hasattr(self.binah, 'learn_associations'):
+                            self.binah.learn_associations(self.reasoning_store)
+                        
                         if self.hod:
-                            self.hod.perform_analysis("Consolidation")
+                            self.hod.reflect("Consolidation")
                 
                 # Prune old operational meta-memories (keep last 3 days of logs)
                 if hasattr(self, 'meta_memory_store'):
                     # 3 days = 259200 seconds
-                    pruned_count = self.meta_memory_store.prune_events(max_age_seconds=259200)
+                    pruned_count = self.meta_memory_store.prune_events(max_age_seconds=259200, prune_all=False)
                     if pruned_count > 0:
-                        print(f"🧹 [Meta-Memory] Pruned {pruned_count} old operational events.")
+                        print(f"🧹 [Meta-Memory] Pruned {pruned_count} old events (ALL types).")
+
+                # Auto-vacuum to reclaim space
+                if hasattr(self, 'memory_store'):
+                    self.memory_store.vacuum()
+
+                # Da'at Topic Lattice (Entity Summarization)
+                if hasattr(self, 'daat') and self.daat:
+                    self.daat.run_topic_lattice()
+                    self.daat.monitor_model_tension()
+
+                # Evaluate Keter (System Coherence)
+                if hasattr(self, 'keter') and self.keter:
+                    self.keter.evaluate()
+
+                # Run Evolution Cycle (Liquid Prompts)
+                if hasattr(self, 'ai_core'):
+                    self.ai_core.run_evolution_cycle()
+                    self.ai_core.generate_daily_self_narrative()
 
             except Exception as e:
                 print(f"Consolidation/Cleanup error: {e}")
@@ -1878,6 +947,7 @@ class DesktopAssistantApp(DesktopAssistantUI):
     def daydream_loop(self):
         """Continuous daydreaming loop"""
         time.sleep(2)  # Initial buffer
+        last_watchdog_check = time.time()
         
         while True:
             try:
@@ -1885,6 +955,15 @@ class DesktopAssistantApp(DesktopAssistantUI):
                 if self.stop_processing_flag:
                     time.sleep(0.01)
                     continue
+
+                # Watchdog: Check for coma state every 60 seconds
+                if time.time() - last_watchdog_check > 60:
+                    last_watchdog_check = time.time()
+                    if self.decider and self.decider.current_task == "wait":
+                        # If waiting for > 5 minutes (300s)
+                        if self.decider.wait_start_time > 0 and (time.time() - self.decider.wait_start_time > 300):
+                            print("⏰ Watchdog: System dormant for >5m. Forcing Pulse.")
+                            self.decider.wake_up("Watchdog Pulse")
 
                 # Check if Decider has work to do
                 has_work = False
@@ -1923,8 +1002,12 @@ class DesktopAssistantApp(DesktopAssistantUI):
                     else:
                         # No work, just sleep
                         # Run observer if idle to maintain "always working" state
-                        if self.observer:
-                            self.observer.perform_observation()
+                        if self.observer and self.decider:
+                            signal = self.observer.perform_observation()
+                            # Feed signal to Decider (which may wake up if pressure is high)
+                            self.decider.ingest_netzach_signal(signal)
+                            # Check for autonomous agency (Curiosity/Study)
+                            self.ai_core.run_autonomous_agency_check(signal)
                         time.sleep(1.0)
                 else:
                     time.sleep(0.01)
@@ -1932,6 +1015,64 @@ class DesktopAssistantApp(DesktopAssistantUI):
             except Exception as e:
                 print(f"Daydream loop error: {e}")
                 time.sleep(1)
+
+    def sync_journal(self):
+        """
+        Compile all Assistant Notes into a journal file and ingest it into the Document Store.
+        This allows the AI to 'read' its own journal via RAG.
+        """
+        try:
+            # 1. Fetch Notes
+            items = self.memory_store.list_recent(limit=None)
+            # Filter for NOTE type
+            notes = [item for item in items if item[1] == "NOTE"]
+            # Sort chronologically (list_recent is DESC, so reverse)
+            notes.reverse()
+
+            if not notes:
+                messagebox.showinfo("Journal", "No journal entries (Notes) to sync.")
+                return
+
+            # 2. Create File Content
+            content = "ASSISTANT JOURNAL\n=================\n\n"
+            for note in notes:
+                # note: (id, type, subject, text, ...)
+                content += f"Entry [ID:{note[0]}]:\n{note[3]}\n\n" + ("-"*30) + "\n\n"
+
+            # 3. Write to Docs Folder
+            docs_dir = "./data/uploaded_docs"
+            os.makedirs(docs_dir, exist_ok=True)
+            filename = "assistant_journal.txt"
+            file_path = os.path.join(docs_dir, filename)
+            
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            # 4. Ingest into Document Store
+            # Remove old version if exists to ensure clean update
+            old_id = self.document_store.get_document_by_filename(filename)
+            if old_id:
+                self.document_store.delete_document(old_id)
+            
+            # Process and Add
+            file_hash = self.document_store.compute_file_hash(file_path)
+            chunks, page_count, file_type = self.document_processor.process_document(file_path)
+            
+            self.document_store.add_document(
+                file_hash=file_hash,
+                filename=filename,
+                file_type=file_type,
+                file_size=os.path.getsize(file_path),
+                page_count=page_count,
+                chunks=chunks,
+                upload_source="journal_sync"
+            )
+            
+            self.refresh_documents()
+            messagebox.showinfo("Journal Sync", f"Journal synced to documents ({len(notes)} entries).")
+            
+        except Exception as e:
+            messagebox.showerror("Journal Sync Error", f"Failed to sync journal: {e}")
 
 def main():
     root = tk.Tk()

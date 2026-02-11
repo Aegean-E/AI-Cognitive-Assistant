@@ -5,7 +5,22 @@ import numpy as np
 import requests
 import os
 import base64
+import threading
+import time
 from typing import List, Dict, Tuple, Callable, Optional
+
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+
+try:
+    from PIL import Image
+    import io
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # ==============================
 # Configuration Defaults
@@ -39,6 +54,87 @@ DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPT
 DEFAULT_MEMORY_EXTRACTOR_PROMPT = MEMORY_EXTRACTOR_PROMPT
 
 # ==============================
+# Epigenetics Hot-Loader
+# ==============================
+
+_EPI_CACHE = {
+    "logic": "",
+    "mtime": 0,
+    "lock": threading.Lock()
+}
+
+def _get_epigenetics_logic() -> str:
+    """Thread-safe hot-loader for epigenetics.json"""
+    path = "./data/epigenetics.json"
+    if not os.path.exists(path):
+        return ""
+        
+    try:
+        stat = os.stat(path)
+        mtime = stat.st_mtime
+        
+        if mtime != _EPI_CACHE["mtime"]:
+            with _EPI_CACHE["lock"]:
+                if mtime != _EPI_CACHE["mtime"]:
+                    with open(path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        _EPI_CACHE["logic"] = data.get("evolved_logic", "")
+                        _EPI_CACHE["mtime"] = mtime
+                        # print(f"🧬 [Epigenetics] Hot-reloaded logic (v{data.get('version', '?')})")
+        return _EPI_CACHE["logic"]
+    except Exception:
+        return _EPI_CACHE["logic"] # Return stale on error
+
+def count_tokens(text: str, model: str = "gpt-4") -> int:
+    """
+    Count tokens using tiktoken for accuracy, falling back to char count.
+    """
+    if not text:
+        return 0
+    
+    if TIKTOKEN_AVAILABLE:
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+            return len(encoding.encode(text))
+        except Exception:
+            pass # Fallback
+    
+    # Fallback: Approx 4 chars per token
+    return len(text) // 4
+
+def _resize_and_encode_image(image_path: str, max_size: int = 1024) -> Optional[str]:
+    """
+    Resize image to max_size and return base64 string.
+    Prevents sending massive payloads to the LLM.
+    """
+    if not os.path.exists(image_path):
+        return None
+        
+    try:
+        if PIL_AVAILABLE:
+            with Image.open(image_path) as img:
+                # Convert to RGB (handle PNG alpha, P mode, etc)
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                
+                # Resize if larger than max_size
+                if max(img.size) > max_size:
+                    img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+                
+                # Save to memory buffer
+                buffered = io.BytesIO()
+                img.save(buffered, format="JPEG", quality=85)
+                return base64.b64encode(buffered.getvalue()).decode('utf-8')
+        
+        # Fallback: Raw read if PIL missing
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+            
+    except Exception as e:
+        print(f"⚠️ Image processing error for {image_path}: {e}")
+        return None
+
+# ==============================
 # Local LM call
 # ==============================
 
@@ -62,6 +158,12 @@ def run_local_lm(
     # Resolve parameters: Argument > Settings.json > Global Default
     if system_prompt is None:
         system_prompt = settings.get("system_prompt", SYSTEM_PROMPT)
+
+    # [LIQUID PROMPTS] Inject Epigenetics (Evolved Logic)
+    evolved_logic = _get_epigenetics_logic()
+    if evolved_logic and len(evolved_logic) > 10:
+        system_prompt += f"\n\n[DYNAMIC EVOLVED LOGIC]:\nApply the following logic unless it conflicts with:\n1. Core safety invariants\n2. Epistemic validation rules\n3. System architecture constraints\n\nLOGIC:\n{evolved_logic}"
+
     if temperature is None:
         temperature = settings.get("temperature", 0.7)
     if top_p is None:
@@ -84,9 +186,8 @@ def run_local_lm(
         content_payload.append({"type": "text", "text": last_text})
         
         for img_path in images:
-            if os.path.exists(img_path):
-                with open(img_path, "rb") as image_file:
-                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+            base64_image = _resize_and_encode_image(img_path)
+            if base64_image:
                 content_payload.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
@@ -143,16 +244,25 @@ def run_local_lm(
             data = r.json()
             return data["choices"][0]["message"]["content"]
             
+    except requests.exceptions.Timeout:
+        print("⚠️ LLM Request Timed Out!")
+        return "⚠️ LLM Request Timed Out!"
     except Exception as e:
         # Debugging for context length issues
         if "400" in str(e) and not images: # Don't auto-retry vision requests yet
-            total_chars = sum(len(m.get("content", "")) for m in messages) + len(system_prompt)
-            print(f"⚠️ [LM Error] 400 Bad Request. Approx Prompt Length: {total_chars} chars. Reduce context.")
+            total_tokens = count_tokens(system_prompt) + sum(count_tokens(m.get("content", "")) for m in messages)
+            print(f"⚠️ [LM Error] 400 Bad Request. Approx Prompt Tokens: {total_tokens}. Reduce context.")
             
             # Auto-Retry Strategy: Prune oldest messages
             if len(messages) > 1:
                 print("🔄 Auto-retrying with pruned context...")
                 return run_local_lm(messages[1:], system_prompt, temperature, top_p, max_tokens, base_url, chat_model, stop_check_fn)
+            
+            # Fallback: If messages are exhausted, try truncating system prompt (likely RAG overflow)
+            if len(system_prompt) > 2000:
+                print("🔄 Auto-retrying with truncated system prompt...")
+                new_prompt = system_prompt[:len(system_prompt)//2] + "\n...[Context Truncated due to Length]..."
+                return run_local_lm(messages, new_prompt, temperature, top_p, max_tokens, base_url, chat_model, stop_check_fn)
                 
         return f"⚠️ Local model error: {e}"
 
@@ -222,7 +332,7 @@ def compute_embedding(text: str, base_url: str = None, embedding_model: str = No
     payload = {"model": embedding_model, "input": text}
     try:
         url = f"{base_url}/embeddings"
-        r = requests.post(url, json=payload, timeout=30)
+        r = requests.post(url, json=payload, timeout=120)
         r.raise_for_status()
         data = r.json()
         emb = np.array(data["data"][0]["embedding"], dtype=float)
@@ -294,7 +404,7 @@ def extract_memories_llm(
     # print("💡 [Debug] Raw LM output for memory extraction:\n", raw)
     data = _parse_json_array_loose(raw)
 
-    ALLOWED_TYPES = {"FACT", "PREFERENCE", "RULE", "PERMISSION", "IDENTITY", "BELIEF", "GOAL"}
+    ALLOWED_TYPES = {"FACT", "PREFERENCE", "RULE", "PERMISSION", "IDENTITY", "BELIEF", "GOAL", "REFUTED_BELIEF"}
     ALLOWED_SUBJECTS = {"User", "Assistant"}
 
     memories, embeddings, cleaned = [], [], []
@@ -359,6 +469,15 @@ def _is_low_quality_candidate(text: str, mem_type: str = None) -> bool:
     if text_lower.endswith("?"):
         return True
 
+    # System Errors / URLs
+    error_patterns = [
+        "client error", "bad request", "local model error", 
+        "encountered an error", "400 client error", "500 server error",
+        "generation failed", "context length"
+    ]
+    if any(p in text_lower for p in error_patterns):
+        return True
+
     # Pure greeting words ONLY (not "Hi, my name is...")
     # Only reject if it's JUST a greeting with no additional info
     pure_greetings = {"hi", "hello", "hey", "greetings", "welcome", "howdy", "nice to meet you"}
@@ -369,7 +488,7 @@ def _is_low_quality_candidate(text: str, mem_type: str = None) -> bool:
     # Too short (< 5 words) - likely filler
     # BUT: IDENTITY, PERMISSION, RULE, GOAL, BELIEF claims are allowed to be short
     word_count = len(text_lower.split())
-    protected_types = {"IDENTITY", "PERMISSION", "RULE", "GOAL", "BELIEF", "PREFERENCE"}
+    protected_types = {"IDENTITY", "PERMISSION", "RULE", "GOAL", "BELIEF", "PREFERENCE", "REFUTED_BELIEF"}
     
     # Allow FACT if it contains "name is" or other identity markers (prevents filtering "My name is X")
     is_identity_fact = "name is" in text_lower or "lives in" in text_lower or "works at" in text_lower or "i am" in text_lower or "user is" in text_lower

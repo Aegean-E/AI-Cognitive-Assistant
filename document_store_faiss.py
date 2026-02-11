@@ -95,6 +95,24 @@ class FaissDocumentStore:
             except sqlite3.OperationalError:
                 pass
 
+            # 1. Enable FTS5 Virtual Table for Keyword Search
+            con.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts 
+                USING fts5(text, content='chunks', content_rowid='id');
+            """)
+            
+            # 2. Trigger to keep FTS synced with Chunks
+            con.execute("""
+                CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+                  INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+                END;
+            """)
+            con.execute("""
+                CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+                  INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.id, old.text);
+                END;
+            """)
+
     # --------------------------
     # FAISS Integration
     # --------------------------
@@ -167,9 +185,18 @@ class FaissDocumentStore:
     def _save_faiss_index(self):
         """Save FAISS index to disk"""
         index_path = self.db_path.replace(".sqlite3", ".faiss")
-        faiss.write_index(self.faiss_index, index_path)
+        temp_path = index_path + ".tmp"
+        try:
+            faiss.write_index(self.faiss_index, temp_path)
+            if os.path.exists(index_path):
+                os.remove(index_path)
+            os.rename(temp_path, index_path)
+        except Exception as e:
+            print(f"⚠️ Failed to save FAISS index: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-    def _add_embeddings_to_faiss(self, embeddings: List[np.ndarray], chunk_ids: List[int]):
+    def _add_embeddings_to_faiss(self, embeddings: List[np.ndarray], chunk_ids: List[int], save_index: bool = True):
         """Add embeddings to FAISS index"""
         if not embeddings:
             return
@@ -189,7 +216,8 @@ class FaissDocumentStore:
             self.chunk_id_mapping.append(chunk_id)
         
         # Save index
-        self._save_faiss_index()
+        if save_index:
+            self._save_faiss_index()
 
     def _sync_faiss_index(self):
         """Ensure FAISS index is in sync with SQLite chunks."""
@@ -261,7 +289,7 @@ class FaissDocumentStore:
 
                 # Add batch to FAISS immediately to free memory
                 if batch_embeddings and self.faiss_index:
-                    self._add_embeddings_to_faiss(batch_embeddings, batch_ids)
+                    self._add_embeddings_to_faiss(batch_embeddings, batch_ids, save_index=False)
 
                 # Save recovered embeddings to DB immediately
                 if batch_updates:
@@ -270,7 +298,11 @@ class FaissDocumentStore:
                         update_con.commit()
 
                 total_processed += len(rows)
-                # print(f"   Processed {total_processed} chunks...")
+                print(f"   Processed {total_processed} chunks...")
+            
+            # Save once at the end
+            if self.faiss_index:
+                self._save_faiss_index()
             
             print(f"✅ FAISS index rebuilt successfully ({total_processed} chunks).")
 
@@ -366,10 +398,7 @@ class FaissDocumentStore:
             chunk_ids = [row[0] for row in chunk_rows]
 
         # Add embeddings to FAISS
-        self._add_embeddings_to_faiss(chunk_embeddings, chunk_ids)
-        
-        # Save FAISS index immediately
-        self._save_faiss_index()
+        self._add_embeddings_to_faiss(chunk_embeddings, chunk_ids, save_index=True)
         
         return document_id
 
@@ -485,6 +514,117 @@ class FaissDocumentStore:
 
         return results
 
+    def search_diverse_chunks(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int = 5,
+        max_per_doc: int = 2
+    ) -> List[Dict]:
+        """
+        Cross-Document Context Search.
+        Searches for chunks but enforces diversity by limiting results per document.
+        Useful for finding links between disparate papers.
+        """
+        # Fetch more results initially to allow for filtering
+        raw_results = self.search_chunks(query_embedding, top_k=top_k * 4)
+        
+        diverse_results = []
+        doc_counts = {}
+        
+        for res in raw_results:
+            doc_id = res['document_id']
+            count = doc_counts.get(doc_id, 0)
+            
+            if count < max_per_doc:
+                diverse_results.append(res)
+                doc_counts[doc_id] = count + 1
+                
+            if len(diverse_results) >= top_k:
+                break
+                
+        return diverse_results
+
+    def search_hybrid(self, query_text: str, query_embedding: np.ndarray, top_k: int = 5) -> List[Dict]:
+        """
+        Combines FAISS (Semantic) and FTS5 (Keyword) results using Reciprocal Rank Fusion.
+        """
+        # 1. Get Semantic Results (FAISS)
+        # Request more results for fusion
+        semantic_results = self.search_chunks(query_embedding, top_k=top_k * 2)
+        
+        # 2. Get Keyword Results (FTS5)
+        keyword_results = []
+        try:
+            with self._connect() as con:
+                # Sanitize query for FTS5 (simple sanitization)
+                safe_query = query_text.replace('"', '""')
+                rows = con.execute("""
+                    SELECT rowid, text, rank 
+                    FROM chunks_fts 
+                    WHERE chunks_fts MATCH ? 
+                    ORDER BY rank LIMIT ?
+                """, (f"\"{safe_query}\"", top_k * 2)).fetchall()
+                
+                for r in rows:
+                    keyword_results.append({'chunk_id': r[0], 'text': r[1]})
+        except Exception as e:
+            print(f"⚠️ FTS5 Search failed: {e}")
+            # Fallback to just semantic results if FTS fails
+            return semantic_results[:top_k]
+
+        # 3. Reciprocal Rank Fusion (RRF)
+        scores = {}
+        k_const = 60
+        
+        # Map chunk_id to semantic item for later retrieval
+        semantic_map = {item['chunk_id']: item for item in semantic_results}
+        
+        for rank, item in enumerate(semantic_results):
+            chunk_id = item['chunk_id']
+            scores[chunk_id] = scores.get(chunk_id, 0) + (1 / (k_const + rank))
+            
+        for rank, item in enumerate(keyword_results):
+            chunk_id = item['chunk_id']
+            scores[chunk_id] = scores.get(chunk_id, 0) + (1 / (k_const + rank))
+
+        # 4. Sort and Fetch Final Details
+        sorted_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
+        
+        final_results = []
+        
+        # Fetch details for IDs that might only be in keyword results (not in semantic_map)
+        missing_ids = [cid for cid in sorted_ids if cid not in semantic_map]
+        fetched_map = {}
+        
+        if missing_ids:
+            # Reuse existing method logic or query directly. Querying directly for efficiency.
+            with self._connect() as con:
+                placeholders = ','.join(['?'] * len(missing_ids))
+                rows = con.execute(f"""
+                    SELECT c.id, c.document_id, c.chunk_index, c.text, c.page_number, d.filename
+                    FROM chunks c
+                    JOIN documents d ON c.document_id = d.id
+                    WHERE c.id IN ({placeholders})
+                """, missing_ids).fetchall()
+                
+                for r in rows:
+                    fetched_map[r[0]] = {
+                        'chunk_id': r[0], 'document_id': r[1], 'chunk_index': r[2],
+                        'text': r[3], 'page_number': r[4], 'filename': r[5], 'similarity': 0.0
+                    }
+        
+        for cid in sorted_ids:
+            if cid in semantic_map:
+                item = semantic_map[cid]
+                item['rrf_score'] = scores[cid]
+                final_results.append(item)
+            elif cid in fetched_map:
+                item = fetched_map[cid]
+                item['rrf_score'] = scores[cid]
+                final_results.append(item)
+                
+        return final_results
+
     # --------------------------
     # Document Queries
     # --------------------------
@@ -514,7 +654,7 @@ class FaissDocumentStore:
             row = con.execute("SELECT id FROM documents WHERE filename = ?", (filename,)).fetchone()
         return row[0] if row else None
 
-    def list_documents(self, limit: int = 50) -> List[Tuple]:
+    def list_documents(self, limit: int = 1000) -> List[Tuple]:
         """List all documents."""
         with self._connect() as con:
             rows = con.execute("""
@@ -612,6 +752,32 @@ class FaissDocumentStore:
                     broken.append({'id': r[0], 'filename': r[1], 'issue': f"Missing embeddings for {r[2]} chunks"})
         
         return broken
+
+    def get_orphaned_chunk_count(self) -> int:
+        """Count chunks that have no parent document."""
+        with self._connect() as con:
+            row = con.execute("""
+                SELECT COUNT(c.id) 
+                FROM chunks c 
+                LEFT JOIN documents d ON c.document_id = d.id 
+                WHERE d.id IS NULL
+            """).fetchone()
+        return row[0] if row else 0
+
+    def delete_orphaned_chunks(self) -> int:
+        """Delete chunks that have no parent document."""
+        with self._connect() as con:
+            cur = con.execute("""
+                DELETE FROM chunks 
+                WHERE document_id NOT IN (SELECT id FROM documents)
+            """)
+            con.commit()
+            count = cur.rowcount
+        
+        if count > 0:
+            self._rebuild_index()
+            
+        return count
 
     def _remove_chunks_from_faiss(self, chunk_ids: List[int]):
         """Remove specific chunks from FAISS index."""

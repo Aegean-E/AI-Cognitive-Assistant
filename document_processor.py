@@ -43,6 +43,18 @@ class DocumentProcessor:
         except ImportError:
             raise ImportError("PyMuPDF (fitz) not installed. Run: pip install PyMuPDF")
 
+        # Check for OCR dependencies
+        try:
+            import pytesseract
+            from PIL import Image
+            import io
+            OCR_AVAILABLE = True
+        except ImportError:
+            OCR_AVAILABLE = False
+
+        # Sanitize filename immediately
+        filename = os.path.basename(file_path).strip().strip('"').strip("'")
+
         try:
             doc = fitz.open(file_path)
         except Exception as e:
@@ -56,12 +68,25 @@ class DocumentProcessor:
             try:
                 page = doc[page_num]
                 text = page.get_text("text")
+                
+                # OCR FALLBACK
+                if not text.strip() and OCR_AVAILABLE:
+                    print(f"⚠️ Page {page_num + 1} seems empty. Attempting OCR...")
+                    try:
+                        pix = page.get_pixmap()
+                        img_data = pix.tobytes("png")
+                        image = Image.open(io.BytesIO(img_data))
+                        text = pytesseract.image_to_string(image)
+                        print(f"✅ OCR extracted {len(text)} chars.")
+                    except Exception as e:
+                        print(f"❌ OCR failed for page {page_num + 1}: {e}")
+
                 pages.append({
                     'page_number': page_num + 1,  # 1-indexed
                     'text': text
                 })
             except Exception as e:
-                print(f"⚠️ Warning: Skipping page {page_num + 1} in {os.path.basename(file_path)} due to error: {e}")
+                print(f"⚠️ Warning: Skipping page {page_num + 1} in {filename} due to error: {e}")
                 continue
 
         doc.close()
@@ -95,6 +120,9 @@ class DocumentProcessor:
         except ImportError:
             raise ImportError("python-docx not installed. Run: pip install python-docx")
 
+        # Sanitize filename immediately
+        filename = os.path.basename(file_path).strip().strip('"').strip("'")
+
         doc = Document(file_path)
 
         # Extract all paragraphs
@@ -108,6 +136,19 @@ class DocumentProcessor:
             chunk['embedding'] = self.embed_fn(chunk['text'])
 
         return chunks, None  # No page count for DOCX
+
+    # --------------------------
+    # TXT Processing
+    # --------------------------
+
+    def process_txt(self, file_path: str) -> Tuple[List[Dict], None]:
+        """Extract text from TXT and chunk it."""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        chunks = self._chunk_text(text)
+        for chunk in chunks:
+            chunk['embedding'] = self.embed_fn(chunk['text'])
+        return chunks, None
 
     # --------------------------
     # Chunking Strategy
@@ -240,6 +281,8 @@ class DocumentProcessor:
             return 'pdf'
         elif ext in ['.docx', '.doc']:
             return 'docx'
+        elif ext == '.txt':
+            return 'txt'
         return None
 
     def process_document(self, file_path: str) -> Tuple[List[Dict], Optional[int], str]:
@@ -260,5 +303,8 @@ class DocumentProcessor:
         elif file_type == 'docx':
             chunks, _ = self.process_docx(file_path)
             return chunks, None, 'docx'
+        elif file_type == 'txt':
+            chunks, _ = self.process_txt(file_path)
+            return chunks, None, 'txt'
         else:
             raise ValueError(f"Unsupported file type: {file_path}")
