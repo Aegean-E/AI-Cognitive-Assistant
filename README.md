@@ -1,4 +1,4 @@
- # AI Desktop Assistant & Cognitive Architecture
+ # Tiferet - A Proto‑Conscious AI Assistant
  
  **Version : 3.0 (The Sentience Update)**
 
@@ -13,9 +13,8 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
-A sophisticated, local-first AI assistant featuring long-term memory, autonomous agency, and a cognitive architecture inspired by the Kabbalistic Tree of Life. Designed to run with local LLMs via LM Studio, ensuring privacy and control. It is designed to be more than a chatbot; it is a persistent digital assistant with a "Life Story". 
 
----
+
 
 ## 🌟 Overview
 
@@ -32,53 +31,46 @@ The architecture is inspired by the Kabbalistic Tree of Life, with specialised m
 
 ---
 
- 
-  ## 🌟 Features
-  
-  - **🧠 Proto-Consciousness:** Implements **Active Inference**, **Recursive Self-Monitoring**, and **Predictive Coding** to simulate self-awareness.
-  - **🗣️ Bicameral Dialogue:** Decisions are negotiated between an "Impulse" (Creative) and "Reason" (Safety) voice.
-  - **⚡ Cognitive Metabolism:** Manages an energy budget (CRS) to prevent burnout and simulate fatigue.
-  - **🌑 Shadow Memory:** Tracks failures and rejected thoughts to learn from mistakes (Negative Knowledge).
-  - **🤖 Cognitive Architecture:** Implements a multi-agent system ("Tree of Life") where modules for creativity, logic, observation, and decision-making interact.
-  - **🔮 Future Simulation:** Runs counterfactual simulations before committing to heavy tasks.
-  - **👥 Theory of Mind:** Models the user's cognitive state to adjust interaction style.
-  - **💾 Long-Term Memory:** Hybrid SQLite + FAISS database storing facts, goals, and interactions indefinitely.
-  - **☁️ Daydreaming:** Autonomous processing of memories and insights when idle.
-  - **📝 Semantic Context Distillation:** Compresses long conversation history to preserve meaning without token overflow.
-  - **📚 Document RAG:** Upload PDF and DOCX files to build a knowledge base. The AI can read, cite, and synthesize information from your documents.
-  - **🔌 Telegram Bridge:** Connects to a Telegram Bot to allow remote interaction with your local AI.
-  - **🛠️ Tool Use:** Capable of executing Python code, performing physics calculations (Fermi Estimation), running causal inference simulations (DoWhy), and managing files.
-  - **🧬 Meta-Learning:** Self-optimizes by extracting strategies from successes and analyzing failures to patch its own system prompts.
-  - **🔒 Privacy Focused:** Designed to work with local models (e.g., Qwen, Llama, Mistral) via LM Studio.
+## ✨ Features at a Glance
+
+- **🧠 Proto‑Consciousness** – Active inference, recursive self‑monitoring, and predictive coding simulate self‑awareness.
+- **🗣️ Bicameral Dialogue** – Every decision is negotiated between an “Impulse” (creative) and “Reason” (safety) voice.
+- **⚡ Cognitive Metabolism** – A resource controller manages an energy budget (tokens/compute) to prevent burnout.
+- **🌑 Shadow Memory** – Failures and rejected thoughts are stored as “negative knowledge” to learn from mistakes.
+- **🔮 Future Simulation** – Lightweight simulations predict the outcome of actions before they are taken.
+- **👥 Theory of Mind** – Models the user’s cognitive state to adapt interaction style.
+- **💾 Long‑Term Memory** – Hybrid SQLite + FAISS database stores facts, goals, and interactions indefinitely.
+- **☁️ Daydreaming** – Autonomous processing of memories and documents when the system is idle.
+- **📚 Document RAG** – Upload PDF/DOCX files to build a knowledge base; the AI can cite sources.
+- **🔌 Telegram Bridge** – Connect a Telegram bot for remote interaction.
+- **🛠️ Tool Use** – Physics calculations (Fermi estimation), causal inference (DoWhy), file management, and more.
+- **🧬 Meta‑Learning** – Self‑optimisation: extracts strategies from successes and analyses failures to patch its own prompts.
+- **🔒 Privacy Focused** – Runs entirely locally with your own LLMs via LM Studio.
+
+---
+
  
 
  ## 🏗️ Architecture: The Tree of Life
  
- The system is organized into interacting modules representing different cognitive faculties:
- 
- ### The Super-Conscious (Will & Intellect)
- - **Keter (Crown):** The silent will. It measures the global "Coherence" of the system. It does not act but biases the strategy of the Decider. If coherence drops, Keter triggers a reasoning reboot.
- - **Chokmah (Wisdom):** The spark of insight. The "Daydreamer" module. It runs when the system is idle, reading random documents or colliding old memories to generate new hypotheses.
- - **Binah (Understanding):** The structure. It handles memory consolidation, deduplication, and association. It ensures that new information fits logically into the existing knowledge base.
- - **Da'at (Knowledge):** The integrator.
-     - **Knowledge Graph:** Extracts RDF triples to build a conceptual map.
-     - **Topic Lattice:** Identifies heavy entities and generates standing summaries.
-     - **Synthesis:** Detects "Isomorphisms" (structural similarities) between unrelated topics.
-     - **Gap Analysis:** Identifies missing information and formulates questions.
- 
- ### The Emotional Forces (Balance)
- - **Hesed (Mercy):** The force of expansion. It calculates a "Permission Budget" based on system stability, allowing the AI to explore new, unverified topics.
- - **Gevurah (Severity):** The force of constraint. It applies pressure when the system becomes too chaotic, repetitive, or overloaded, forcing the Decider to prune memories or stop daydreaming.
- - **Tiferet (Beauty/Decider):** The executive controller. It balances Hesed and Gevurah.
-     - **HTN Planning:** Decomposes complex goals into Hierarchical Task Networks.
-     - **Tool Use:** Executes actions (Search, Calculator, File I/O, Physics).
-     - **Decision Making:** Determines whether to Chat, Daydream, or Verify.
- 
- ### The Operational Level (Action)
- - **Netzach (Victory/Endurance):** The silent observer. A background thread that monitors the conversation flow. It detects stagnation (boredom) or loops and injects "signals" to nudge the Decider.
- - **Hod (Glory/Reverberation):** The analyst. It runs *after* actions to critique them. It verifies facts against source documents, summarizes sessions, and flags hallucinations.
- - **Yesod (Foundation):** The bridge. Manages the connection to the external world via the Telegram API.
- - **Malkuth (Kingdom):** The physical realization. The Causal Engine responsible for real-world actions (Code execution, Physics checks, Causal Inference).
+The system is divided into interacting modules, each representing a cognitive faculty.
+
+
+| Sephirah       | Role                                      |
+|----------------|-------------------------------------------|
+| **Keter**      | Crown – measures global coherence (silent will) |
+| **Chokmah**    | Wisdom – the “daydreamer”, generates insights |
+| **Binah**      | Understanding – memory consolidation and deduplication |
+| **Da’at**      | Knowledge – builds knowledge graphs, identifies gaps, synthesises ideas |
+| **Hesed**      | Mercy – expansion force, allows exploration |
+| **Gevurah**    | Severity – constraint force, prunes chaos |
+| **Tiferet**    | Beauty – the Decider, balances Hesed & Gevurah |
+| **Netzach**    | Victory – silent observer, detects stagnation |
+| **Hod**        | Glory – analyst, verifies facts and reflects |
+| **Yesod**      | Foundation – bridge to the outside world (Telegram) |
+| **Malkuth**    | Kingdom – physical realisation (UI, file system, causal engine) |
+
+---
 
 ## 🛠️ Installation
 
@@ -96,7 +88,7 @@ The architecture is inspired by the Kabbalistic Tree of Life, with specialised m
 1.  Clone the repository.
 2.  Install dependencies:
     ```bash
-    pip install requests numpy faiss-cpu ttkbootstrap PyMuPDF python-docx Pillow pyinstaller
+    pip install requests numpy faiss-cpu ttkbootstrap PyMuPDF python-docx Pillow networkx pyvis dowhy pandas
     ```
 3.  Run the application:
     ```bash
@@ -119,8 +111,10 @@ To create a standalone executable:
 ## 🎮 Usage Guide
 
 ### Modes
--   **Chat Mode**: The AI pauses background research to respond instantly to you.
--   **Daydream Mode**: The AI runs background loops. It might be reading or thinking. It will still reply to chat, but might finish its current thought first.
+
+Chat Mode – The AI responds instantly to you; background daydreaming is paused.
+
+Daydream Mode – The AI autonomously reads documents, consolidates memories, and pursues its own goals. It still replies to chat, but may finish its current thought first.
 
 ### Commands
 You can control the system via natural language or slash commands.
@@ -165,16 +159,39 @@ You can control the system via natural language or slash commands.
 
 ## 🖥️ UI Features
 
--   **Chat Tab**: Main interface. Includes "AI Interactions" panel at the bottom.
--   **Logs Tab**: Real-time system logs.
--   **Memory Database Tab**:
-    -   View Memories, Summaries, and Meta-Memories.
-    -   **Export Summaries**: Save session history to text file.
-    -   **Compress**: Manually trigger summary consolidation.
--   **Documents Tab**:
-    -   Upload PDF/DOCX.
-    -   Search/Filter documents.
-    -   **Check Integrity**: Find and fix broken document chunks.
+The application features a multi‑tabbed GUI built with ttkbootstrap:
+
+- 💬 Chat – Main conversation window with an internal thought panel.
+- 📝 Logs – Real‑time system logs.
+- 🗄️ Memory Database – View memories, summaries, meta‑memories, and chronicles; export summaries.
+- 📈 Graph – Visualise the knowledge graph (requires PyVis).
+- 📚 Documents – Upload and manage documents; check integrity.
+- ⚙️ Settings – Configure API endpoints, models, prompts, and thresholds.
+- ❓ Help – Quick reference.
+- ℹ️ About – Version information.
+
+##  🧬 Meta‑Learning & Self‑Improvement
+
+- Strategy Extraction – When a goal is completed, the system learns an abstract strategy and stores it as a RULE.
+- Failure Analysis – Refuted beliefs are analysed to generate self‑correction rules.
+- Epigenetic Evolution – Architectural hyperparameters (thresholds, biases) mutate over time based on performance.
+- Self‑Model – The AI maintains a statistical model of its own performance to predict future outcomes.
+
+## 🤝 Contributing
+
+Contributions are welcome! Please follow these steps:
+
+Fork the repository.
+
+Create a feature branch (git checkout -b feature/AmazingFeature).
+
+Commit your changes (git commit -m 'Add some AmazingFeature').
+
+Push to the branch (git push origin feature/AmazingFeature).
+
+Open a Pull Request.
+
+Make sure to run the code through Black and add appropriate tests if possible.
 
 ## 📝 License
 
@@ -187,6 +204,9 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 - [LM Studio](https://lmstudio.ai/) - Local LLM runtime
 - [Telegram Bot API](https://core.telegram.org/bots/api) - Bot platform
 - Qwen, Nomic Embed - Open-source models
+- DoWhy – causal inference library
+- PyVis – network visualisation
+- ttkbootstrap – modern Tkinter themes
 
 ---
 
