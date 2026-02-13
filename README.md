@@ -4,7 +4,7 @@
 
 <div align="center">
 
-  <img src="banner.png" width="1280" alt="Tiferet - A Proto‑Conscious AI Assistant - Banner">
+  <img src="banner.jpg" width="1280" alt="Tiferet - A Proto‑Conscious AI Assistant - Banner">
 
   <br />
 
