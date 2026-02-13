@@ -15,6 +15,22 @@
 
 A sophisticated, local-first AI assistant featuring long-term memory, autonomous agency, and a cognitive architecture inspired by the Kabbalistic Tree of Life. Designed to run with local LLMs via LM Studio, ensuring privacy and control. It is designed to be more than a chatbot; it is a persistent digital assistant with a "Life Story". 
 
+---
+
+## 🌟 Overview
+
+This project is not just a chatbot – it is a persistent, self‑evolving digital assistant that:
+
+- Remembers every interaction and learns from them (long‑term memory)
+- Actively reads and synthesises information from uploaded documents (PDF, DOCX, TXT)
+- Runs autonomous “daydreaming” cycles to generate insights and hypotheses
+- Reflects on its own reasoning to detect and correct mistakes
+- Connects to Telegram so you can interact with it remotely
+- Uses only local LLMs (via LM Studio), keeping your data private
+
+The architecture is inspired by the Kabbalistic Tree of Life, with specialised modules for creativity, logic, observation, decision‑making, and meta‑cognition.
+
+---
 
  
   ## 🌟 Features
