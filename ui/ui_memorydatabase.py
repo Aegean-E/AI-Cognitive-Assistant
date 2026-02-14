@@ -53,17 +53,17 @@ class MemoryDatabaseUI:
         # Chat Memories Tab
         chat_memories_frame = ttk.Frame(db_notebook)
         db_notebook.add(chat_memories_frame, text="Chat Memories")
-        self.chat_memories_scrollable_frame = self._setup_scrollable_frame(chat_memories_frame)
+        self.chat_memories_tree = self._setup_treeview(chat_memories_frame)
 
         # Daydream Memories Tab
         daydream_memories_frame = ttk.Frame(db_notebook)
         db_notebook.add(daydream_memories_frame, text="Daydream Memories")
-        self.daydream_memories_scrollable_frame = self._setup_scrollable_frame(daydream_memories_frame)
+        self.daydream_memories_tree = self._setup_treeview(daydream_memories_frame)
 
         # Chronicles Tab (formerly Journal/Assistant Notes)
         notes_frame = ttk.Frame(db_notebook)
         db_notebook.add(notes_frame, text="Chronicles")
-        self.notes_scrollable_frame = self._setup_scrollable_frame(notes_frame)
+        self.notes_tree = self._setup_treeview(notes_frame)
 
         # Meta-Memories Tab
         meta_frame = ttk.Frame(db_notebook)
@@ -135,6 +135,100 @@ class MemoryDatabaseUI:
 
         return scrollable_frame
 
+    def _setup_treeview(self, parent):
+        """Helper to setup a Treeview for memory display."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        columns = ("ID", "Type", "Subject", "Text")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", bootstyle="info")
+        
+        # Track sort direction
+        tree.sort_directions = {col: False for col in columns}
+
+        for col in columns:
+            tree.heading(col, text=f"{col} ↕", command=lambda c=col, t=tree: self.sort_memory_column(t, c))
+            tree.column(col, width=100 if col != "Text" else 600)
+
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Bind double-click to expand memory
+        tree.bind("<Double-1>", self._on_memory_double_click)
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        return tree
+
+    def sort_memory_column(self, tree, col):
+        """Sort the treeview by the given column with toggle functionality"""
+        tree.sort_directions[col] = not tree.sort_directions[col]
+        is_descending = tree.sort_directions[col]
+
+        arrow = " ↓" if is_descending else " ↑"
+        for c in tree.sort_directions.keys():
+            current_text = tree.heading(c)['text']
+            clean_text = current_text.split()[0]
+            if c == col:
+                tree.heading(c, text=f"{clean_text}{arrow}")
+            else:
+                tree.heading(c, text=f"{clean_text} ↕")
+
+        items = [(tree.set(k, col), k) for k in tree.get_children('')]
+        
+        is_numeric = col in ['ID']
+        if is_numeric:
+            def sort_key(item):
+                try: return int(item[0])
+                except: return float('inf')
+            items.sort(key=sort_key, reverse=is_descending)
+        else:
+            items.sort(key=lambda x: x[0].lower(), reverse=is_descending)
+
+        for index, (val, k) in enumerate(items):
+            tree.move(k, '', index)
+
+    def _on_memory_double_click(self, event):
+        """Open a detail window for the selected memory."""
+        tree = event.widget
+        selection = tree.selection()
+        if not selection:
+            return
+        
+        item_id = tree.set(selection[0], "ID")
+        if not item_id:
+            return
+            
+        # Fetch full data from store
+        mem_data = self.memory_store.get(int(item_id))
+        if not mem_data:
+            return
+            
+        # Create detail window
+        detail_win = tk.Toplevel(self.root)
+        detail_win.title(f"Memory Detail - ID: {item_id}")
+        detail_win.geometry("700x500")
+        
+        # Header info
+        header_frame = ttk.Frame(detail_win, padding=10)
+        header_frame.pack(fill=tk.X)
+        
+        ttk.Label(header_frame, text=f"ID: {item_id}", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=10)
+        ttk.Label(header_frame, text=f"Type: {mem_data['type']}", bootstyle="info").pack(side=tk.LEFT, padx=10)
+        ttk.Label(header_frame, text=f"Subject: {mem_data['subject']}", bootstyle="success").pack(side=tk.LEFT, padx=10)
+        
+        # Full Text
+        text_frame = ttk.LabelFrame(detail_win, text="Full Memory Text")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        text_area = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, font=("Arial", 11))
+        text_area.pack(fill=tk.BOTH, expand=True)
+        text_area.insert(tk.END, mem_data['text'])
+        text_area.config(state=tk.DISABLED)
+        
+        # Close button
+        ttk.Button(detail_win, text="Close", command=detail_win.destroy, bootstyle="secondary").pack(pady=10)
+
     def refresh_database_view(self):
         """Refresh the database views"""
         if not getattr(self, 'memory_store', None) or not getattr(self, 'meta_memory_store', None):
@@ -179,9 +273,8 @@ class MemoryDatabaseUI:
         try:
             # 1. Clear existing widgets
             for widget in self.summaries_scrollable_frame.winfo_children(): widget.destroy()
-            for widget in self.chat_memories_scrollable_frame.winfo_children(): widget.destroy()
-            for widget in self.daydream_memories_scrollable_frame.winfo_children(): widget.destroy()
-            for widget in self.notes_scrollable_frame.winfo_children(): widget.destroy()
+            for tree in [self.chat_memories_tree, self.daydream_memories_tree, self.notes_tree]:
+                for item in tree.get_children(): tree.delete(item)
 
             # 2. Update Stats
             self.memory_stats_var.set(stats_text)
@@ -231,9 +324,9 @@ class MemoryDatabaseUI:
                     # Convert dict to tuple: (id, type, subject, text, source)
                     note_items.append((n['id'], "NARRATIVE", n['subject'], n['text'], "meta_memory"))
 
-            self._populate_memory_tab(self.chat_memories_scrollable_frame, chat_items)
-            self._populate_memory_tab(self.daydream_memories_scrollable_frame, daydream_items)
-            self._populate_memory_tab(self.notes_scrollable_frame, note_items)
+            self._populate_tree(self.chat_memories_tree, chat_items)
+            self._populate_tree(self.daydream_memories_tree, daydream_items)
+            self._populate_tree(self.notes_tree, note_items)
 
             # 4. Populate Summaries
             if not summary_items:
@@ -280,6 +373,15 @@ class MemoryDatabaseUI:
             self.status_var.set("Ready")
         except Exception as e:
             logging.error(f"UI Update Error: {e}")
+
+    def _populate_tree(self, tree, items):
+        """Helper to populate a treeview with memory items."""
+        for item in tree.get_children():
+            tree.delete(item)
+        for mem in items:
+            # mem is a tuple: (id, type, subject, text, source, ...)
+            display_text = mem[3][:100] + "..." if len(mem[3]) > 100 else mem[3]
+            tree.insert("", "end", values=(mem[0], mem[1], mem[2], display_text))
 
     def export_summaries(self):
         """Export session summaries to a text file"""

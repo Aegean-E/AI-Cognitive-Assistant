@@ -4,8 +4,7 @@ import ttkbootstrap as ttk
 import json
 import os
 import logging
-from ai_core.lm import DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT
-from treeoflife.chokmah import DAYDREAM_EXTRACTOR_PROMPT as DEFAULT_DAYDREAM_EXTRACTOR_PROMPT
+from docs.default_prompts import DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT, DAYDREAM_EXTRACTOR_PROMPT as DEFAULT_DAYDREAM_EXTRACTOR_PROMPT
 
 class SettingsUI:
     """Mixin for Settings UI tab"""
@@ -217,6 +216,20 @@ class SettingsUI:
         ])
         theme_combo.grid(row=0, column=1, padx=5, pady=5)
 
+        # FAISS Settings
+        faiss_frame = ttk.LabelFrame(memory_frame, text="FAISS Index Settings")
+        faiss_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Label(faiss_frame, text="Index Type:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.faiss_index_type_var = tk.StringVar(value="IndexFlatIP")
+        faiss_type_combo = ttk.Combobox(faiss_frame, textvariable=self.faiss_index_type_var, values=["IndexFlatIP", "IndexIVFFlat"])
+        faiss_type_combo.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(faiss_frame, text="nlist (for IndexIVFFlat):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.faiss_nlist_var = tk.IntVar(value=100)
+        faiss_nlist_entry = ttk.Entry(faiss_frame, textvariable=self.faiss_nlist_var, width=10)
+        faiss_nlist_entry.grid(row=1, column=1, padx=5, pady=5)
+
         # Plugins tab
         plugins_frame = ttk.Frame(settings_notebook)
         settings_notebook.add(plugins_frame, text=" Plugins")
@@ -270,6 +283,9 @@ class SettingsUI:
         perms = self.settings.get("permissions", {})
         for tool, var in self.permission_vars.items():
             var.set(perms.get(tool, True))
+
+        self.faiss_index_type_var.set(self.settings.get("faiss_index_type", "IndexFlatIP"))
+        self.faiss_nlist_var.set(self.settings.get("faiss_nlist", 100))
 
     def setup_permissions_tab(self, parent):
         """Setup tool permissions interface."""
@@ -409,6 +425,9 @@ class SettingsUI:
             # Permissions
             permissions = {t: var.get() for t, var in self.permission_vars.items()}
             self.settings["permissions"] = permissions
+            
+            self.settings["faiss_index_type"] = self.faiss_index_type_var.get()
+            self.settings["faiss_nlist"] = self.faiss_nlist_var.get()
 
             self.save_settings()
 

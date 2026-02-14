@@ -10,6 +10,7 @@ import ttkbootstrap as ttk
 import sys
 import os
 from datetime import datetime
+from collections import deque
 import re
 import queue
 import weakref
@@ -57,15 +58,12 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
 
     def setup_ui(self):
         """Setup the main UI"""
-        # Initialize buffers for thread-safe logging
-        self.log_buffer = []
-        self.debug_log_buffer = []
+        self.image_references = [] # Store image references to prevent garbage collection
         
         # Thread-safe GUI Queue
         self.gui_queue = queue.Queue()
         self.start_queue_poller()
 
-        # Main notebook for tabs
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
@@ -118,6 +116,14 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
 
         # Apply initial theme colors to text widgets
         self.apply_theme_colors()
+
+    def redirect_logging(self):
+        """Redirect stdout and stderr to the logs tab"""
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+
+        sys.stdout = StdoutRedirector(self, self.original_stdout)
+        sys.stderr = StdoutRedirector(self, self.original_stderr)
 
     def start_queue_poller(self):
         """Poll the GUI queue for updates from background threads."""
@@ -304,6 +310,7 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
 
     def clear_chat_display(self):
         """Clear the chat history display."""
+        self.image_references.clear()
         self.chat_history.config(state=tk.NORMAL)
         self.chat_history.delete(1.0, tk.END)
         self.chat_history.config(state=tk.DISABLED)
@@ -329,7 +336,7 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
         """Toggle the visibility of the internal thought process pane"""
         if self.show_thoughts_var.get():
             self.chat_paned.add(self.netzach_container, weight=1)
-        else:
+        elif self.netzach_container in self.chat_paned.winfo_children(): # Check if it's actually added
             try:
                 self.chat_paned.forget(self.netzach_container)
             except tk.TclError:
@@ -387,18 +394,15 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
     def log_to_main(self, message):
         """Thread-safe logging to main log widget"""
         # Buffer for thread-safe access
-        if not hasattr(self, 'log_buffer'): self.log_buffer = []
-        
         if message is None:
             return
+            
         if not isinstance(message, str):
             message = str(message)
             
         self.log_buffer.append(message)
-        if len(self.log_buffer) > 5000:
-            self.log_buffer = self.log_buffer[-4000:]
 
-        if hasattr(self, 'main_log_text'):
+        if hasattr(self, 'gui_queue'):
             self.gui_queue.put(("log", message))
 
     def _log_to_main_safe(self, message):
@@ -451,9 +455,6 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
                 img.thumbnail(thumbnail_size, Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 
-                # Keep reference to prevent GC
-                if not hasattr(self, 'image_references'):
-                    self.image_references = []
                 self.image_references.append(photo)
                 
                 # Insert image
@@ -500,7 +501,7 @@ class DesktopAssistantUI(DocumentsUI, SettingsUI, MemoryDatabaseUI, GraphUI):
             self.chat_history.delete("1.0", "100.0")
             
         # Clean up old image references
-        if hasattr(self, 'image_references') and len(self.image_references) > 50:
+        if len(self.image_references) > 50:
             # Keep only the last 50 images
             self.image_references = self.image_references[-50:]
             
