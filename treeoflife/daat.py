@@ -1454,8 +1454,12 @@ class Daat:
         
         try:
             with self.memory_store._connect() as con:
-                # Get links
-                links = con.execute("SELECT source_id, target_id, relation_type, strength FROM memory_links").fetchall()
+                # Get links (Limit to top 5000 most recent/strongest to prevent memory exhaustion)
+                links = con.execute("""
+                    SELECT source_id, target_id, relation_type, strength 
+                    FROM memory_links 
+                    ORDER BY created_at DESC LIMIT 5000
+                """).fetchall()
                 
                 # Get nodes (to ensure we have labels)
                 # Optimization: Only fetch nodes that are part of the graph

@@ -113,7 +113,20 @@ class ContinuousObserver:
             doc_logs = self.get_doc_logs()
             status = self.get_status()
             recent_docs = self.get_recent_docs()
+
+            recent_thoughts = self.reasoning_store.list_recent(limit=10)
+            if not isinstance(recent_thoughts, (list, tuple)) or len(recent_thoughts) < 3:
+                return
+
+            context = "\n".join([t['content'] for t in recent_thoughts[1:5]]) if isinstance(recent_thoughts,
+                                                                                            (list, tuple)) else ""
             
+            if not isinstance(history, list): history = []
+            # Defensive check for non-list returns from stores to prevent slicing errors
+            if not isinstance(recent_reasoning, list): recent_reasoning = []
+            if not isinstance(active_goals, list): active_goals = []
+            if not isinstance(meta_memories, list): meta_memories = []
+
             # Boost motivation if we see recent successes
             # Check recent reasoning for "success" or "completed"
             if any("success" in r['content'].lower() or "completed" in r['content'].lower() for r in recent_reasoning):
@@ -304,7 +317,7 @@ class ContinuousObserver:
         if not history:
             return {"hesed": 0.5, "gevurah": 0.5}
             
-        # 1. Retrieve Long-Term Creator Model
+        # 1. Retrieve Long-Term User Model
         creator_model = "User is the Creator."
         try:
             # Search for the specific identity node
@@ -356,10 +369,10 @@ class ContinuousObserver:
 
         settings = self.get_settings()
         prompt = (
-            f"Analyze the Creator's recent discourse:\n{user_text}\n\n"
+            f"Analyze the User's recent discourse:\n{user_text}\n\n"
             "TASK: Update the psychological profile of the User.\n"
             "Identify patterns: When is he critical? When is he playful? What triggers stress?\n"
-            "Output a concise 'Creator Model' summary."
+            "Output a concise 'User Model' summary."
         )
         
         model_text = run_local_lm(

@@ -21,6 +21,7 @@ Meta-Memory: Automatically creates meta-memories when consolidation happens
 
 import time
 import json
+import re
 from typing import List, Dict, Optional, Callable, Tuple
 from datetime import datetime
 import logging
@@ -271,7 +272,7 @@ class Binah:
             count = len(valid_items)
             
             # SCALABILITY UPGRADE: Use FAISS for large groups to avoid O(N^2) freeze
-            use_faiss = FAISS_AVAILABLE
+            use_faiss = FAISS_AVAILABLE and count > 100 # Use FAISS for groups larger than 100
             faiss_index = None
             
             if use_faiss:
@@ -321,7 +322,7 @@ class Binah:
                     if new['id'] in identity_consolidated_ids: continue
                     
                     # Refuted Belief Barrier: Never merge a live Belief with a Refuted one
-                    # (Even if they end up in the same group via loose typing)
+                    # (Even if they end up in the same group via loose typing or high similarity)
                     types = {old['type'], new['type']}
                     if 'BELIEF' in types and 'REFUTED_BELIEF' in types:
                         continue
@@ -330,7 +331,7 @@ class Binah:
                     cached_sim = self.memory_store.get_comparison_similarity(old['id'], new['id'])
                     # Trust the cache if it exists and is below threshold (this handles the 0.5 poison pill from failed entailment)
                     if cached_sim is not None and cached_sim < threshold:
-                        continue
+                        continue # Skip if previously determined not to merge
 
                     # Log high-similarity comparisons to show "thinking"
                     if similarity > threshold - 0.05:
@@ -530,7 +531,11 @@ class Binah:
 
         # Skip redundant meta-memories where value hasn't actually changed
         # (e.g., during pointer-only updates or deduplication)
-        if old_value == new_value and event_type in ("VERSION_UPDATE", "SIMILARITY_LINK"):
+        # Normalize for comparison
+        norm_old = re.sub(r'\s+', ' ', old_value.lower().strip())
+        norm_new = re.sub(r'\s+', ' ', new_value.lower().strip())
+
+        if norm_old == norm_new and event_type in ("VERSION_UPDATE", "SIMILARITY_LINK"):
             return
 
         # Format timestamp
@@ -659,10 +664,13 @@ class Binah:
             "Output ONLY one word: EQUIVALENT, SUBSUMED, CONTRADICTION, or RELATED."
         )
         
+        settings = self.get_settings()
         response = run_local_lm(
             [{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=10
+            max_tokens=10,
+            base_url=settings.get("base_url"),
+            chat_model=settings.get("chat_model")
         ).strip().upper()
         
         return response in ["EQUIVALENT", "SUBSUMED"]
@@ -761,9 +769,10 @@ class Binah:
         expanded_context = []
         visited = set(seed_memory_ids)
         
-        for mid in seed_memory_ids:
+        # Limit seeds processed to prevent DB storm
+        for mid in seed_memory_ids[:3]:
             # Get neighbors from memory_links table
-            neighbors = self.memory_store.get_associated_memories(mid, min_strength=0.5)
+            neighbors = self.memory_store.get_associated_memories(mid, min_strength=0.6)
             
             for n in neighbors:
                 if n['id'] not in visited:

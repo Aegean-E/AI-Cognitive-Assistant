@@ -11,7 +11,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Dict, Any, Optional, List
-from ai_core.lm import compute_embedding, run_local_lm, extract_memory_candidates, DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT
+from ai_core.lm import compute_embedding, run_local_lm, extract_memory_candidates, count_tokens, LLMError, DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT
 from ai_core.utils import parse_json_array_loose
 
 try:
@@ -120,6 +120,10 @@ class Decider:
         self.last_simulation_time = 0
         self.last_utility_log_time = 0
         self.last_utility_score = 0.0
+        
+        # Critical Memory Cache
+        self._critical_memories_cache = []
+        self._last_critical_update = 0
         
         # Capture baselines for relative limits
         settings = self.get_settings()
@@ -306,10 +310,11 @@ class Decider:
     def _on_conscious_content(self, event):
         """Handle high-salience events from Global Workspace."""
         data = event.data
-        salience = data.get("salience", 0.0)
+        salience = data.get("final_salience", data.get("salience", 0.0))
         content = data.get("content", "")
+        c_type = data.get("type", "")
         
-        if salience > 0.9:
+        if salience > 0.9 and c_type != "DRIVE":
             self.log(f"🔦 Decider: High Salience Event ({salience:.2f}): {content}. Interrupting.")
             # If we are daydreaming, stop and attend
             if self.heartbeat and self.heartbeat.current_task == "daydream":
@@ -318,6 +323,12 @@ class Decider:
 
     def create_goal(self, content: str):
         """Autonomously create a new GOAL memory."""
+        # DEDUPLICATION: Don't create the same goal twice
+        existing = self.memory_store.get_active_by_type("GOAL")
+        if any(content.lower() in g[2].lower() for g in existing):
+            self.log(f"🎯 Decider: Goal already exists, skipping: {content}")
+            return None
+
         # Deterministic identity for goals
         identity = self.memory_store.compute_identity(content, "GOAL")
         
@@ -622,9 +633,13 @@ class Decider:
 
         # Pass metrics to CRS
         crs_status = {}
-        if self.crs:
-             # Use a dummy task type for system check
-             crs_status = self.crs.allocate("system_check", coherence=coherence, structural_metrics=structural_metrics, violation_pressure=self.value_core.get_violation_pressure() if self.value_core else 0.0)
+        try:
+            if self.crs:
+                # Use a dummy task type for system check
+                crs_status = self.crs.allocate("system_check", coherence=coherence, structural_metrics=structural_metrics, violation_pressure=self.value_core.get_violation_pressure() if self.value_core else 0.0)
+        except Exception as e:
+            self.log(f"⚠️ Decider: CRS allocation failed during system check: {e}")
+            crs_status = {}
         
         system_mode = crs_status.get("system_mode", "EXECUTION")
         allow_goal_creation = crs_status.get("allow_goal_creation", True)
@@ -892,26 +907,6 @@ class Decider:
             # Safety Truncation (Estimate 1 char ~= 0.25 tokens, keep safe buffer)
             MAX_CONTEXT_CHARS = 10000  # Reduced to ~2500 tokens to be safe
 
-            if len(context) > MAX_CONTEXT_CHARS:
-                # NEW: Attempt to compress reasoning before truncating
-                if self.actions.get("compress_reasoning"):
-                    self.log("⚠️ Context budget exceeded. Running DB compression...")
-                    self.actions["compress_reasoning"]()
-
-                # Keep the first 20% (recent/relevant) and last 20% (immediate context)
-                # Distill the middle.
-                cut_size = int(MAX_CONTEXT_CHARS * 0.2)
-                middle_content = context[cut_size:-cut_size]
-                
-                if len(middle_content) > 1000:
-                     self.log("⚠️ Distilling middle context...")
-                     middle_content = self._distill_context(middle_content)
-                
-                context = (
-                    context[:cut_size] 
-                    + f"\n\n...[CONTEXT DISTILLED]...\n{middle_content}\n...[END DISTILLATION]...\n\n" 
-                    + context[-cut_size:]
-                )
 
             # Check if we just finished a heavy task to enforce cooldown
             # just_finished_heavy = self.current_task in ["daydream", "verify", "verify_all"]
@@ -2217,6 +2212,10 @@ class Decider:
 
     def _get_critical_memories(self):
         """Retrieve always-active memories (Identity, Permission, Goals, Rules)."""
+        now = time.time()
+        if now - self._last_critical_update < 300 and self._critical_memories_cache:
+            return self._critical_memories_cache
+
         critical_types = ["IDENTITY", "PERMISSION", "RULE", "GOAL", "CURIOSITY_GAP"]
         mems = []
         for t in critical_types:
@@ -2225,8 +2224,12 @@ class Decider:
             # Sort by ID descending to prioritize recent items
             items.sort(key=lambda x: x[0], reverse=True)
 
+            # Limit high-volume types to prevent context bloat
+            if t in ["RULE", "GOAL", "CURIOSITY_GAP"]:
+                items = items[:5]
+
             daydream_count = 0
-            daydream_limit = 5  # Allow limited daydream memories to support learning
+            daydream_limit = 3  # Reduced from 5
 
             for item in items:
                 mid, subj, text, source = item[0], item[1], item[2], item[3]
@@ -2236,6 +2239,9 @@ class Decider:
                     daydream_count += 1
                 # Format to match list_recent: (id, type, subject, text, source, verified, flags)
                 mems.append((mid, t, subj, text, source, 1, None))
+        
+        self._critical_memories_cache = mems
+        self._last_critical_update = now
         return mems
 
     def _analyze_intent(self, text: str) -> str:
@@ -2324,18 +2330,34 @@ class Decider:
         if learn_match:
             raw_topic = learn_match.group(1).strip(" .?!")
             
-            # Clean topic: remove "from your documents", "from files", etc.
-            clean_topic = re.sub(r"\s+from\s+(?:your\s+)?(?:documents|files|database|memory|docs).*", "", raw_topic, flags=re.IGNORECASE).strip()
-            
-            if clean_topic:
-                self.create_goal(f"Expand knowledge about {clean_topic}")
-                self.log(f"🤖 Decider starting Daydream Loop focused on: {clean_topic}")
+            # Use LLM to extract the core topic more robustly
+            settings = self.get_settings()
+            core_topic_prompt = (
+                f"Extract the core topic from this phrase: '{raw_topic}'. "
+                "Remove any extraneous phrases like 'from your documents', 'research about', 'learn about', etc. "
+                "Output ONLY the core topic."
+            )
+            core_topic = run_local_lm(
+                messages=[{"role": "user", "content": core_topic_prompt}],
+                system_prompt="You are a precise topic extractor.",
+                temperature=0.1,
+                max_tokens=50,
+                base_url=settings.get("base_url"),
+                chat_model=settings.get("chat_model"),
+                stop_check_fn=self.stop_check
+            ).strip()
+
+            if core_topic and not core_topic.startswith("⚠️"):
+                self.create_goal(f"Expand knowledge about {core_topic}")
+                self.log(f"🤖 Decider starting Daydream Loop focused on: {core_topic}")
                 self._run_action("start_loop")
                 self.daydream_mode = "read"
-                self.daydream_topic = clean_topic
+                self.daydream_topic = core_topic
                 if self.heartbeat:
-                    self.heartbeat.force_task("daydream", 5, f"Research: {clean_topic}")
-                return f"📚 Initiating research protocol for: {clean_topic}. I will read relevant documents and generate insights."
+                    self.heartbeat.force_task("daydream", 5, f"Research: {core_topic}")
+                return f"📚 Initiating research protocol for: {core_topic}. I will read relevant documents and generate insights."
+            else:
+                return f"⚠️ Failed to extract a clear topic from '{raw_topic}'. Please be more specific."
 
         # Verify All
         if "run verification all" in text or "verify all" in text:
@@ -2522,9 +2544,15 @@ class Decider:
             )
             
             # 2. Start Memory Retrieval (DB)
-            future_recent = submit_fn(self.memory_store.list_recent, limit=10)
-            future_chat = submit_fn(self._get_recent_chat_memories, limit=20)
+            t_retrieval = time.time()
+            def fetch_combined():
+                # Fetch recent non-daydream items (chat) and general recent items
+                chat_mems = self.memory_store.get_recent_filtered(limit=10, exclude_sources=['daydream'])
+                recent_mems = self.memory_store.list_recent(limit=5)
+                return chat_mems, recent_mems
+            future_combined = submit_fn(fetch_combined)
             future_critical = submit_fn(self._get_critical_memories)
+            logging.debug(f"⏱️ [Tiferet] Memory retrieval submission took {time.time()-t_retrieval:.3f}s")
             
             # 3. Start Summary Retrieval (DB)
             def get_summary():
@@ -2539,24 +2567,26 @@ class Decider:
             query_embedding = future_embedding.result()
             
             # 4. Start Semantic Search (FAISS/DB)
-            future_semantic = submit_fn(self.memory_store.search, query_embedding, limit=10, target_affect=self.mood)
+            future_semantic = submit_fn(self.memory_store.search, query_embedding, limit=5, target_affect=self.mood)
             
             # 4.5 Start Meta-Memory Semantic Search (Autobiographical Memory)
-            future_meta_semantic = submit_fn(self.meta_memory_store.search, query_embedding, limit=5)
+            future_meta_semantic = submit_fn(self.meta_memory_store.search, query_embedding, limit=3)
             
             # 5. Start RAG (FAISS/DB)
             future_rag = None
             if self._should_trigger_rag(user_text):
-                self.log(f"📚 [RAG] Searching documents for: '{user_text}'")
+                t_rag = time.time()
+                self.log(f"📚 [RAG] Initiating document search for: '{user_text}'")
                 def perform_rag():
                     doc_results = self.document_store.search_chunks(query_embedding, top_k=5)
                     filename_matches = self.document_store.search_filenames(user_text)
                     return doc_results, filename_matches
                 future_rag = submit_fn(perform_rag)
+                logging.debug(f"⏱️ [Tiferet] RAG submission took {time.time()-t_rag:.3f}s")
             
             # Gather all results
-            recent_items = future_recent.result()
-            chat_items = future_chat.result()
+            t_gather = time.time()
+            chat_items, recent_items = future_combined.result()
             critical_items = future_critical.result()
             summary_text = future_summary.result()
             semantic_items = future_semantic.result()
@@ -2564,9 +2594,11 @@ class Decider:
             
             # --- Active Association via Binah ---
             associative_items = []
-            if self.binah and semantic_items:
-                seed_ids = [item[0] for item in semantic_items]
-                assoc_results = self.binah.expand_associative_context(seed_ids, limit=5)
+            # Only expand if semantic results are weak or few
+            if self.binah and semantic_items and (len(semantic_items) < 3 or semantic_items[0][4] < 0.8):
+                # Limit seeds to top 3 to reduce DB queries
+                seed_ids = [item[0] for item in semantic_items[:3]]
+                assoc_results = self.binah.expand_associative_context(seed_ids, limit=3)
                 # Convert to tuple format: (id, type, subject, text, similarity)
                 for res in assoc_results:
                     # Use strength as similarity score
@@ -2579,6 +2611,7 @@ class Decider:
             filename_matches = []
             if future_rag:
                 doc_results, filename_matches = future_rag.result()
+            logging.debug(f"⏱️ [Tiferet] Context gathering result wait took {time.time()-t_gather:.3f}s")
         finally:
             if local_executor:
                 local_executor.shutdown(wait=False)
@@ -2704,24 +2737,32 @@ class Decider:
         if memory_context:
             system_prompt = memory_context + system_prompt
 
+        # Log final prompt length
+        prompt_tokens = count_tokens(system_prompt)
+        self.log(f"📝 Final Prompt: {len(system_prompt)} chars (~{prompt_tokens} tokens)")
+
         # NEW: Self-Improvement Prompt (Appended after memory context)
         self_improvement_prompt = settings.get("self_improvement_prompt", "")
         if self_improvement_prompt:
             system_prompt += "\n\n" + self_improvement_prompt
 
-        # 4. Call LLM
-        start_time = time.time()
-        reply = run_local_lm(
-            history, 
-            system_prompt=system_prompt,
-            temperature=settings.get("temperature", 0.7),
-            top_p=settings.get("top_p", 0.94),
-            max_tokens=settings.get("max_tokens", 800),
-            base_url=settings.get("base_url"),
-            chat_model=settings.get("chat_model"),
-            stop_check_fn=current_stop_check,
-            images=[image_path] if image_path else None
-        )
+        # 4. Call LLM with structured error handling
+        try:
+            start_time = time.time()
+            reply = run_local_lm(
+                history, 
+                system_prompt=system_prompt,
+                temperature=settings.get("temperature", 0.7),
+                top_p=settings.get("top_p", 0.94),
+                max_tokens=settings.get("max_tokens", 800),
+                base_url=settings.get("base_url"),
+                chat_model=settings.get("chat_model"),
+                stop_check_fn=current_stop_check,
+                images=[image_path] if image_path else None
+            )
+        except LLMError as e:
+            self.log(f"❌ Chat generation failed: {e}")
+            return "⚠️ I encountered an error generating a response. Please check the logs."
         latency = time.time() - start_time
         
         # Feed Keter (Vibrational Monitoring)
@@ -2839,17 +2880,20 @@ class Decider:
         """Determine if we should run RAG based on user input."""
         text = text.strip().lower()
         
+        # More restrictive keywords
         force_keywords = {
-            "search", "find", "document", "file", "pdf", "docx", "content", 
-            "read", "summarize", "summary", "reference", "source", "lookup",
-            "according to", "check", "journal"
+            "search for", "find in", "document", "file", "pdf", "docx", 
+            "read the", "summarize the", "according to", "lookup"
         }
         if any(kw in text for kw in force_keywords): return True
         
         if "?" in text:
-            conversational = ["how are you", "how is it going", "what's up", "who are you", "what is your name"]
+            conversational = ["how are you", "how is it going", "what's up", "who are you", "what is your name", "hi", "hello"]
             if any(c in text for c in conversational): return False
-            return True
+            
+            # Only trigger if it looks like a knowledge-seeking question
+            knowledge_triggers = ["what is", "who is", "tell me about", "explain", "how does"]
+            return any(k in text for k in knowledge_triggers)
             
         # Default to False to prevent slowdown on statements
         return False
@@ -2860,7 +2904,7 @@ class Decider:
             # Use a simplified instruction to defer to the System Prompt (which is configurable in settings)
             # This prevents the hardcoded instruction in lm.py from overriding the detailed settings prompt
             custom_instr = "Analyze the conversation. Extract all durable memories (Identity, Facts, Goals, etc.) based on the System Rules. Return JSON."
-
+            
             candidates = extract_memory_candidates(
                 user_text=user_text,
                 assistant_text=assistant_text,
@@ -2871,40 +2915,40 @@ class Decider:
                 custom_instruction=custom_instr,
                 stop_check_fn=self.stop_check
             )
-
+            
             # Add source metadata and filter by confidence
             for c in candidates:
                 c["source"] = "assistant"
-                c["confidence"] = float(c.get("confidence", 0.9))
-
+                try:
+                    c["confidence"] = float(c.get("confidence", 0.9))
+                except (ValueError, TypeError):
+                    self.log(f"⚠️ Invalid confidence value '{c.get('confidence')}'. Defaulting to 0.5.")
+                    c["confidence"] = 0.5
+            
             # Filter: skip low-confidence
             candidates = [c for c in candidates if c.get("confidence", 0.5) > 0.4]
 
-            if not candidates: return
+            if not candidates:
+                return
 
-            # Reasoning layer
+            # Batch add to Reasoning Store
+            reasoning_entries = []
             for c in candidates:
-                self.reasoning_store.add(content=c["text"], source=c.get("source", "assistant"), confidence=c.get("confidence", 0.9))
-
-            # Arbiter promotion
-            promoted = 0
-            for c in candidates:
-                r = self.reasoning_store.search(c["text"], top_k=1)
-                if not r or len(r) == 0: continue
-                
-                mid = self.arbiter.consider(
-                    text=r[0]["content"],
-                    mem_type=c.get("type", "FACT"),
-                    subject=c.get("subject", "User"),
-                    confidence=c.get("confidence", 0.85),
-                    source=r[0].get("source", "reasoning")
-                )
-                
-                if mid is not None:
-                    promoted += 1
+                reasoning_entries.append({
+                    "content": c["text"],
+                    "source": c.get("source", "assistant"),
+                    "confidence": c.get("confidence", 0.9)
+                })
             
-            if promoted:
-                self.log(f"🧠 Promoted {promoted} memory item(s).")
+            if reasoning_entries:
+                self.reasoning_store.add_batch(reasoning_entries)
+                self.log(f"🧠 Added {len(reasoning_entries)} candidates to Reasoning Store.")
+
+            # Arbiter promotion (batch)
+            promoted_ids = self.arbiter.consider_batch(candidates)
+            
+            if promoted_ids:
+                self.log(f"🧠 Promoted {len(promoted_ids)} memory item(s).")
 
         except Exception as e:
             self.log(f"Memory extraction error: {e}\n{traceback.format_exc()}")
@@ -2995,7 +3039,11 @@ class Decider:
             chat_model=settings.get("chat_model")
         )
         
-        steps = parse_json_array_loose(response)
+        try:
+            steps = parse_json_array_loose(response)
+        except Exception as e:
+            self.log(f"⚠️ Goal decomposition JSON parsing failed: {e}. Response: {response[:100]}...")
+            return False
         
         if steps:
             self.log(f"🏗️ The Architect: Breaking goal '{goal_text}' into {len(steps)} steps.")
@@ -3072,7 +3120,11 @@ class Decider:
             chat_model=settings.get("chat_model")
         )
         
-        new_goals = parse_json_array_loose(response)
+        try:
+            new_goals = parse_json_array_loose(response)
+        except Exception as e:
+            self.log(f"⚠️ Autonomous goal generation JSON parsing failed: {e}. Response: {response[:100]}...")
+            return
         for g in new_goals:
             if isinstance(g, str):
                 self.create_goal(g)

@@ -128,8 +128,11 @@ class Hod:
             recent_memories = self.memory_store.get_memories_after_id(self.last_memory_id, limit=50)
             recent_meta = self.meta_memory_store.get_meta_memories_after_id(self.last_meta_id, limit=50)
             recent_reasoning = self.reasoning_store.get_reasoning_after_id(self.last_reasoning_id, limit=50)
-            
-            # Update cursors & Log ranges
+
+            recent_thoughts = self.reasoning_store.list_recent(limit=10)
+            if not isinstance(recent_thoughts, (list, tuple)) or len(recent_thoughts) < 3:
+                return
+
             range_info = []
             if recent_memories:
                 range_info.append(f"Memories {recent_memories[0][0]}-{recent_memories[-1][0]}")
@@ -144,10 +147,16 @@ class Hod:
             if range_info:
                 self.log(f"🔮 Hod Analysis Range: {', '.join(range_info)}")
             
+            # Defensive type checks for logs
+            if not isinstance(main_logs, str):
+                main_logs = str(main_logs) if main_logs is not None else ""
+
             context = f"--- HOD ANALYSIS CONTEXT (Trigger: {trigger}) ---\n"
             context += f"System Logs (Last 15 lines):\n{main_logs[-1000:]}\n\n" # Truncate logs
             
             if doc_logs:
+                if not isinstance(doc_logs, str):
+                    doc_logs = str(doc_logs)
                 context += f"Document Logs:\n{doc_logs[-1000:]}\n\n" # Truncate doc logs
             
             if recent_memories:
@@ -325,21 +334,12 @@ class Hod:
                     for f in futures:
                         f.cancel()
                     break
-                
                 try:
                     result = future.result()
                     if result:
                         proposals.append(result)
                 except Exception as e:
                     self.log(f"❌ [Verifier] Thread error: {e}")
-        else:
-            with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                futures = {executor.submit(self._verify_single_memory, mem): mem for mem in batch}
-                for future in as_completed(futures):
-                    if stop_check_fn and stop_check_fn():
-                        self.log("🛑 [Verifier] Verification stopped by user.")
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        break
                     try:
                         result = future.result()
                         if result:
@@ -417,7 +417,15 @@ class Hod:
                 }
             
             # Fetch chunks for context reconstruction (No caching in parallel mode to avoid complexity/locks)
-            all_chunks = self.document_store.get_document_chunks(doc_id, include_embeddings=False)
+            # Fetch only the relevant chunks identified by search_results, plus a small window
+            relevant_chunk_indices = set()
+            for res in search_results:
+                relevant_chunk_indices.add(res['chunk_index'])
+                # Add window of +/- 1 chunk for context
+                relevant_chunk_indices.add(res['chunk_index'] - 1)
+                relevant_chunk_indices.add(res['chunk_index'] + 1)
+            
+            all_chunks = self.document_store.get_specific_chunks(doc_id, list(relevant_chunk_indices), include_embeddings=False)
             chunk_map = {c['chunk_index']: c['text'] for c in all_chunks}
                 
             # Search chunks in that document using the memory's content

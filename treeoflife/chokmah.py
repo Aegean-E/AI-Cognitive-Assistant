@@ -9,34 +9,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from ai_core.lm import run_local_lm, extract_memory_candidates, compute_embedding, _is_low_quality_candidate
 from ai_core.utils import parse_json_array_loose
-
-# Specialized prompt for extracting insights from internal monologue
-DAYDREAM_EXTRACTOR_PROMPT = (
-    "Extract insights, goals, facts, and preferences from the Assistant's internal monologue. "
-    "Return ONLY a valid JSON array.\n\n"
-    "Memory Types:\n"
-    "- GOAL: Specific, actionable objectives for the Assistant (e.g., 'Assistant plans to cross-reference X with Y'). Do NOT extract general statements like 'Future research should...' as GOALs; classify them as BELIEFS or FACTS instead.\n"
-    "- FACT: Objective truths derived from documents or reasoning\n"
-    "- BELIEF: Opinions, convictions, hypotheses, or research insights\n"
-    "- REFUTED_BELIEF: Ideas explicitly proven false or rejected. (e.g. 'Assistant rejected the idea that...')\n"
-    "- PREFERENCE: Personal likes/dislikes ONLY (e.g., 'Assistant enjoys sci-fi'). DO NOT use for research suggestions, hypotheses, or document relevance.\n\n"
-    "Rules:\n"
-    "1. Extract from the Assistant's text.\n"
-    "2. Each object MUST have: \"type\", \"subject\" (must be 'Assistant'), \"text\".\n"
-    "3. Use DOUBLE QUOTES for all keys and string values.\n"
-    "4. Max 5 memories.\n"
-    "5. MAKE MEMORIES SELF-CONTAINED: Replace pronouns like 'This', 'These', 'It' with specific nouns. Ensure the text makes sense without the surrounding context.\n"
-    "6. Return ONLY the JSON array. If no new memories, return [].\n"
-)
-
-DAYDREAM_INSTRUCTION = (
-    "Analyze the Internal Monologue above. "
-    "Extract key insights as FACT, BELIEF, GOAL, or PREFERENCE memories for the Assistant. "
-    "Format as JSON objects with keys: 'type', 'subject' (must be 'Assistant'), 'text'. "
-    "Ensure the text includes the source document filename if mentioned. "
-    "CRITICAL: Replace pronouns (e.g., 'This', 'These', 'It') with specific nouns to make the memory self-contained. "
-    "Return ONLY a valid JSON array. Do not invent sources."
-)
+from docs.default_prompts import DAYDREAM_EXTRACTOR_PROMPT, DAYDREAM_INSTRUCTION
 
 class Chokmah:
     """
@@ -142,6 +115,7 @@ class Chokmah:
                 if has_docs:
                     response = "[READ_RANDOM]"
                 else:
+                    reading_filename = None # No document being read
                     self.log("☁️ Impulse was 'read', but library is empty. Switching to Philosophy.")
                     response = "[PHILOSOPHIZE]"
             elif impulse == "research":
@@ -152,6 +126,7 @@ class Chokmah:
                 if has_docs:
                     response = "[READ_RANDOM]"
                 else:
+                    reading_filename = None # No document being read
                     self.log(f"☁️ Topic '{topic}' set, but library is empty. Switching to Philosophy.")
                     response = "[PHILOSOPHIZE]"
             elif not goals and not recent_memories:
@@ -159,6 +134,7 @@ class Chokmah:
                 if has_docs:
                     response = "[READ_RANDOM]"
                 else:
+                    reading_filename = None # No document being read
                     response = "[PHILOSOPHIZE]"
             else:
                 doc_status = "You have access to a library of documents." if has_docs else "The document library is currently EMPTY."
@@ -264,7 +240,7 @@ class Chokmah:
                                             selected_doc = random.choice(relevant_docs)
                                             self.log(f"☁️ Found document semantically related to '{topic}': {selected_doc[1]}")
                                 except Exception as e:
-                                    self.log(f"⚠️ Topic search failed: {e}")
+                                    self.log(f"⚠️ Chokmah: Topic search failed for '{topic}': {e}")
 
                         if not selected_doc:
                             selected_doc = random.choice(docs)

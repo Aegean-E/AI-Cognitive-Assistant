@@ -261,7 +261,7 @@ class Keter:
         """
         try:
             recent_thoughts = self.reasoning_store.list_recent(limit=10)
-            if len(recent_thoughts) < 5:
+            if not isinstance(recent_thoughts, (list, tuple)) or len(recent_thoughts) < 5:
                 return
 
             # Check for simple repetition of the last thought
