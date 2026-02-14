@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime
+import difflib
 from typing import Optional, Any
 
 # Command sets
@@ -33,9 +34,18 @@ NON_LOCKING_COMMANDS = {
     "/memories", "/chatmemories", "/chatmemory", "/metamemories", "/meta-memories", 
     "/memorystats", "/memorystatistics", 
     "/documents", "/docs", "/listdocs", 
-    "/listcommands", "/help", "/commands",
+    "/listcommands", "/help", "/commands", "/shadow", "/goals",
     "/specialmemories", "/notes"
 }
+
+# Flatten all commands for fuzzy matching
+ALL_COMMANDS = set().union(
+    RESET_CHAT, RESET_MEMORY, RESET_REASONING, RESET_META_MEMORY, RESET_ALL,
+    REMOVE_IDENTITY, REMOVE_FACT, REMOVE_PREFERENCE, REMOVE_GOAL, REMOVE_BELIEF,
+    REMOVE_PERMISSION, REMOVE_RULE, REMOVE_REFUTED,
+    DOCUMENT_LIST, DOCUMENT_REMOVE, DOCUMENT_CONTENT,
+    NON_LOCKING_COMMANDS
+)
 
 def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
     """Process slash commands and return response if matched"""
@@ -44,6 +54,16 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
         return None
     
     cmd = cmd_parts[0].lower()
+    
+    # Fuzzy Matching for UX
+    if cmd.startswith("/") and cmd not in ALL_COMMANDS and cmd != "/y":
+        matches = difflib.get_close_matches(cmd, ALL_COMMANDS, n=1, cutoff=0.8)
+        if matches:
+            suggestion = matches[0]
+            # Auto-correct if very close, or suggest
+            # For safety, we'll just suggest for now unless it's a harmless command
+            return f"❓ Unknown command '{cmd}'. Did you mean '{suggestion}'?"
+
 
     # Confirmation handling
     if cmd == "/y":
@@ -85,7 +105,7 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
     app.pending_confirmation_command = None
 
     # Consolidation
-    if cmd in {"/consolidate", "/consolidatenow"}:
+    if cmd in {"/consolidate", "/consolidatenow", "/dream"}:
         def run_consolidation():
             app.log_to_main("🧠 [Binah] Starting manual consolidation...")
             stats = app.binah.consolidate(time_window_hours=None)
@@ -250,7 +270,13 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
             return "🧠 No meta-memories."
         
         lines = []
-        for (_id, event_type, subject, text, created_at) in items:
+        for item in items:
+            _id = item[0]
+            event_type = item[1]
+            subject = item[2]
+            text = item[3]
+            created_at = item[4]
+            
             event_emoji = {
                 "MEMORY_CREATED": "✨", "VERSION_UPDATE": "🔄",
                 "CONFLICT_DETECTED": "⚠️", "CONSOLIDATION": "🔗"
@@ -258,6 +284,33 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
             lines.append(f"{event_emoji} [{subject}] {text}")
         
         return "🧠 Meta-Memories (Reflections):\n" + "\n".join(lines)
+
+    # Shadow Memory View (Adversarial Error Log)
+    if cmd in {"/shadow", "/shadowmemory", "/errors"}:
+        if hasattr(app.memory_store, 'get_shadow_memories'):
+            items = app.memory_store.get_shadow_memories(limit=10)
+            if not items:
+                return "🌑 No shadow memories (mistakes) found."
+            
+            lines = []
+            for item in items:
+                date_str = datetime.fromtimestamp(item['created_at']).strftime("%Y-%m-%d %H:%M")
+                lines.append(f"[{date_str}] ⚠️ {item['text'][:50]}... -> {item['reason']}")
+            return "🌑 Shadow Memory (Recent Failures):\n" + "\n".join(lines)
+        return "❌ Memory store does not support shadow memory."
+
+    # Goals View
+    if cmd in {"/goals", "/activegoals"}:
+        goals = app.memory_store.get_active_by_type("GOAL")
+        if not goals:
+            return "🎯 No active goals."
+        
+        lines = [f"🎯 Active Goals ({len(goals)}):"]
+        for g in goals:
+            # g: (id, subject, text, source, confidence, progress)
+            progress = g[5] if len(g) > 5 else 0.0
+            lines.append(f"- [ID:{g[0]}] {g[2]} ({int(progress*100)}%)")
+        return "\n".join(lines)
 
     # Chat Memories View
     if cmd in {"/chatmemories", "/chatmemory"}:
@@ -301,7 +354,7 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
         return "🧠 Chat Memories (No Daydreams):\n" + "\n".join(lines)
 
     # Assistant Notes (formerly Special Memories)
-    if cmd in {"/note", "/notes", "/specialmemory", "/specialmemories"}:
+    if cmd in {"/note", "/notes", "/specialmemory", "/specialmemories", "/chronicle", "/chronicles"}:
         # If arguments provided, create note
         if len(cmd_parts) > 1:
             content = text[len(cmd_parts[0]):].strip()
@@ -369,13 +422,18 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
         cycle_limit = int(app.settings.get("daydream_cycle_limit", 15))
         cycle_info = f"(Cycle {app.daydream_cycle_count}/{cycle_limit})"
         
-        status_msg += f"🤖 AI Mode: {'🔒 Chat Mode (Daydream Paused)' if app.chat_mode_var.get() else '☁️ Daydream Mode (Active)'} {cycle_info}\n"
+        status_msg += f"🤖 AI Mode: ☁️ Daydream Mode (Active) {cycle_info}\n"
         status_msg += f"⚙️ Processing: {'⏳ Busy' if app.is_processing else '✅ Idle'}\n"
         status_msg += f"📚 Knowledge Base: {app.document_store.get_total_documents()} files ({app.document_store.get_total_chunks()} chunks)\n"
         
         mem_items = app.memory_store.list_recent(limit=None)
         verified_count = sum(1 for item in mem_items if len(item) > 5 and item[5] == 1)
         status_msg += f"🧠 Memory: {len(mem_items)} active nodes ({verified_count} verified)\n"
+        
+        if app.keter:
+            keter_stats = app.keter.evaluate()
+            status_msg += f"👑 Keter Coherence: {keter_stats.get('keter', 0.0):.4f}\n"
+            
         return status_msg
 
     # Memory Statistics
@@ -395,22 +453,12 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
         stats = f"📊 **Memory Statistics**\n\n**Total:** {len(items)}\n**Verified:** {verified_count} ({verified_count/len(items)*100:.1f}%)\n\n**By Type:**\n" + "\n".join([f"- {t}: {c}" for t, c in sorted(by_type.items(), key=lambda x: x[1], reverse=True)]) + "\n\n**By Source:**\n" + "\n".join([f"- {s}: {c}" for s, c in sorted(by_source.items(), key=lambda x: x[1], reverse=True)])
         return stats
 
-    # Exit Chat Mode
-    if cmd == "/exitchatmode":
-        if app.chat_mode_var.get():
-            app.chat_mode_var.set(False)
-            app.on_chat_mode_toggle()
-            return "🔓 Chat Mode disabled. Daydreaming will resume shortly."
-        return "ℹ️ Chat Mode is already disabled."
-
     # Daydream Status
     if cmd in {"/daydreamstatus", "/ddstatus"}:
         cycle_limit = int(app.settings.get("daydream_cycle_limit", 15))
         status_msg = "☁️ **Daydream Status**\n\n"
         
-        if app.chat_mode_var.get():
-            status_msg += "🚫 State: Paused (Chat Mode Active)\n"
-        elif not app.decider:
+        if not app.decider:
             status_msg += "❌ State: Not Initialized\n"
         else:
             status_msg += f"✅ State: {'Processing' if app.is_processing else 'Active (Idle loop)'}\n"
@@ -479,7 +527,6 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
             "**System:**\n"
             "• `/Status` - Show system state\n"
             "• `/DaydreamStatus` - Show daydream cycle info\n"
-            "• `/ExitChatMode` - Resume daydreaming\n\n"
             "• `/Disrupt` - Interrupt current loop (Telegram only)\n"
             "• `/Stop` - Stop ALL processing (Chat, Docs, Verify)\n"
             "• `/StopVerifying` - Stop verification loop\n"
@@ -490,6 +537,8 @@ def handle_command(app: Any, text: str, chat_id: int) -> Optional[str]:
             "• `/ChatMemories` - Show chat memories\n"
             "• `/MetaMemories` - Show memory logs\n"
             "• `/MemoryStats` - Show memory counts\n"
+            "• `/Shadow` - Show recent errors\n"
+            "• `/Goals` - Show active goals\n"
             "• `/Consolidate` - Merge duplicates\n"
             "• `/SpecialMemories` - Show special memories\n"
             "• `/SpecialMemory [text]` - Add special memory\n"
