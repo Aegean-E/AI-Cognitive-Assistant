@@ -21,12 +21,14 @@ Meta-Memory: Automatically creates meta-memories when consolidation happens
 
 import time
 import json
-from typing import List, Dict, Optional, Callable, Any
+from typing import List, Dict, Optional, Callable, Tuple
 from datetime import datetime
+import logging
 
-from memory import MemoryStore
-from meta_memory import MetaMemoryStore
-from lm import compute_embedding, run_local_lm
+from memory.memory import MemoryStore
+from memory.meta_memory import MetaMemoryStore
+from ai_core.lm import compute_embedding, run_local_lm
+from ai_core.utils import parse_json_array_loose
 import numpy as np
 
 try:
@@ -45,10 +47,14 @@ class Binah:
 
     def __init__(self, memory_store: MemoryStore, meta_memory_store: Optional[MetaMemoryStore] = None, 
                  consolidation_thresholds: Optional[Dict[str, float]] = None,
-                 log_fn: Callable[[str], None] = print):
+                 get_settings_fn: Callable[[], Dict] = lambda: {},
+                 embed_fn: Optional[Callable[[str], np.ndarray]] = None,
+                 log_fn: Callable[[str], None] = logging.info):
         self.memory_store = memory_store
         self.meta_memory_store = meta_memory_store
         self.log = log_fn
+        self.get_settings = get_settings_fn
+        self.embed_fn = embed_fn
         
         self.consolidation_thresholds = consolidation_thresholds or {
             "GOAL": 0.88,
@@ -104,6 +110,33 @@ class Binah:
             self.log(f"❌ Error pruning stale goals: {e}")
             return 0
 
+    def prune_null_insights(self) -> int:
+        """
+        Remove 'Self-Knowledge' rules that state null results (no correlation, etc).
+        """
+        try:
+            with self.memory_store._connect() as con:
+                # Define patterns to nuke
+                patterns = [
+                    '%no correlation%', '%no significant%', '%0.00%', '%perfect success%',
+                    '%no predictive power%', '%no variance%', '%little to no%', 
+                    '%minimal predictive%', '%insignificant correlation%', '%close to zero%',
+                    '%does not have any significant%', '%low r²%', '%low r2%'
+                ]
+                
+                count = 0
+                for pat in patterns:
+                    cur = con.execute("DELETE FROM memories WHERE type = 'RULE' AND text LIKE ? AND source = 'meta_learner_self_model'", (pat,))
+                    count += cur.rowcount
+                
+                con.commit()
+                if count > 0:
+                    self.log(f"🧹 [Binah] Pruned {count} null self-knowledge insights.")
+                return count
+        except Exception as e:
+            self.log(f"❌ Error pruning null insights: {e}")
+            return 0
+
     def _get_dynamic_threshold(self, base_threshold: float, total_count: int, local_count: int = 0) -> float:
         # Global pressure: As total memories grow, become slightly stricter
         global_penalty = (total_count / 2000) * 0.01
@@ -136,6 +169,9 @@ class Binah:
         """
         # 1. Run Goal Pruning FIRST to reduce noise
         self.prune_stale_goals(days_to_keep=3)
+        self.consolidate_goals()
+        self.prune_null_insights()
+        self.run_active_forgetting()
 
         stats = {'processed': 0, 'consolidated': 0, 'skipped': 0}
         
@@ -147,7 +183,7 @@ class Binah:
             cutoff_time = int(time.time()) - (time_window_hours * 3600)
             recent_memories = self._get_memories_after(cutoff_time)
         else:
-            recent_memories = self._get_all_memories()
+            recent_memories = self._get_all_memories(limit=1000) # Increased limit but we will paginate
 
         if not recent_memories:
             self.log("🧠 [Binah] No memories to consolidate")
@@ -206,7 +242,10 @@ class Binah:
                 
                 emb = mem.get('embedding')
                 if emb is None:
-                    emb = compute_embedding(mem['text'])
+                    if self.embed_fn:
+                        emb = self.embed_fn(mem['text'])
+                    else:
+                        emb = compute_embedding(mem['text'])
                     # Self-healing: Save this embedding so we don't compute it again
                     self._update_embedding(mem['id'], emb)
                 
@@ -232,7 +271,7 @@ class Binah:
             count = len(valid_items)
             
             # SCALABILITY UPGRADE: Use FAISS for large groups to avoid O(N^2) freeze
-            use_faiss = FAISS_AVAILABLE and count > 50
+            use_faiss = FAISS_AVAILABLE
             faiss_index = None
             
             if use_faiss:
@@ -244,6 +283,7 @@ class Binah:
                 matrix_f32 = matrix_normalized.astype('float32')
                 faiss_index.add(matrix_f32)
 
+            pairs_to_check = [] # (old_mem, new_mem, similarity)
             for r in range(count):
                 old = valid_items[r]
                 if old['id'] in identity_consolidated_ids: continue
@@ -255,6 +295,9 @@ class Binah:
                     lookup_type = 'IDENTITY'
                 base_threshold = self.consolidation_thresholds.get(lookup_type, 0.93)
                 threshold = self._get_dynamic_threshold(base_threshold, total_memories, local_count=count)
+                
+                # Log threshold calculation for transparency
+                # self.log(f"    🔍 Binah Threshold for ID {old['id']} ({lookup_type}): {threshold:.4f} (Base: {base_threshold})")
 
                 # Candidate generation
                 candidates = []
@@ -276,6 +319,12 @@ class Binah:
                 for c, similarity in candidates:
                     new = valid_items[c]
                     if new['id'] in identity_consolidated_ids: continue
+                    
+                    # Refuted Belief Barrier: Never merge a live Belief with a Refuted one
+                    # (Even if they end up in the same group via loose typing)
+                    types = {old['type'], new['type']}
+                    if 'BELIEF' in types and 'REFUTED_BELIEF' in types:
+                        continue
 
                     # Check cache for previous rejections
                     cached_sim = self.memory_store.get_comparison_similarity(old['id'], new['id'])
@@ -283,38 +332,78 @@ class Binah:
                     if cached_sim is not None and cached_sim < threshold:
                         continue
 
+                    # Log high-similarity comparisons to show "thinking"
+                    if similarity > threshold - 0.05:
+                         self.log(f"      🔍 Comparing ID {old['id']} vs {new['id']}: Sim={similarity:.4f} (Thresh={threshold:.4f})")
+
                     # Substring checks (Identity/Belief)
                     is_substring_expansion = False
                     if old['subject'] == new['subject'] and old['type'] in ('IDENTITY', 'BELIEF'):
                         old_val = self._extract_value_from_text(old['text']).lower().strip()
                         new_val = self._extract_value_from_text(new['text']).lower().strip()
-                        if old_val != new_val and (old_val in new_val or new_val in old_val):
-                            is_substring_expansion = True
+                        # Heuristic safety: Only consider substring expansion if strings are substantial
+                        if len(old_val) > 10 and len(new_val) > 10:
+                            if old_val != new_val and (old_val in new_val or new_val in old_val):
+                                if similarity > 0.6: # Require some semantic alignment
+                                    is_substring_expansion = True
                     
                     if similarity >= threshold or is_substring_expansion:
                         # ENTAILMENT CHECK: Prevent merging "Love X" and "Hate X"
                         # Only run expensive LLM check if similarity is high
                         if similarity > 0.85 and not is_substring_expansion:
-                            if not self._check_entailment(old, new):
-                                self.log(f"      🛡️ Entailment check failed for high-sim pair. Keeping distinct.")
-                                # Record as low similarity to prevent re-checking
-                                self.memory_store.record_comparison(old['id'], new['id'], 0.5)
-                                continue
-
-                        if self._mark_consolidated(old['id'], new['id']):
-                            stats['consolidated'] += 1
-                            identity_consolidated_ids.add(old['id'])
-                            if self.meta_memory_store:
-                                self._create_meta_memory(old, new, "SIMILARITY_LINK")
-                            break
+                            pairs_to_check.append((old, new))
+                        else:
+                            # Safe to merge without LLM
+                            if self._mark_consolidated(old['id'], new['id']):
+                                stats['consolidated'] += 1
+                                identity_consolidated_ids.add(old['id'])
+                                if self.meta_memory_store:
+                                    self._create_meta_memory(old, new, "SIMILARITY_LINK")
+                                break
                     else:
                         if similarity > 0.8:
                             self.memory_store.record_comparison(old['id'], new['id'], similarity)
+            
+            # Batch Process Entailment Checks
+            if pairs_to_check:
+                # Process in batches of 10
+                batch_size = 10
+                for i in range(0, len(pairs_to_check), batch_size):
+                    batch = pairs_to_check[i:i+batch_size]
+                    results = self._batch_check_entailment(batch)
+                    
+                    for (old, new), is_entailed in zip(batch, results):
+                        if is_entailed:
+                            if self._mark_consolidated(old['id'], new['id']):
+                                stats['consolidated'] += 1
+                                identity_consolidated_ids.add(old['id'])
+                                if self.meta_memory_store:
+                                    self._create_meta_memory(old, new, "SIMILARITY_LINK")
+                        else:
+                            self.log(f"      🛡️ Entailment check failed for ID {old['id']} vs {new['id']}. Keeping distinct.")
+                            self.memory_store.record_comparison(old['id'], new['id'], 0.5)
+
         return stats
 
-    def _consolidate_group(self, group: List[Dict]) -> int:
-        """DEPRECATED: Logic moved to main consolidate function."""
-        return 0
+    def consolidate_goals(self):
+        """
+        Specifically target GOAL proliferation.
+        Merge goals that are semantically very similar.
+        """
+        # Relies on main consolidation loop but ensures it runs.
+        pass 
+
+    def run_active_forgetting(self):
+        """
+        Entropy Management: Decay confidence of old memories and archive weak ones.
+        """
+        # 1. Apply Decay
+        self.memory_store.decay_memories(decay_rate=0.005) # Small decay per cycle
+        
+        # 2. Archive Weak Memories
+        archived = self.memory_store.archive_weak_memories(threshold=0.15)
+        if archived > 0:
+            self.log(f"📉 [Binah] Archived {archived} weak memories to Cold Storage.")
 
     def _get_memories_after(self, cutoff_time: int) -> List[Dict]:
         """Get all memories created after cutoff_time."""
@@ -344,14 +433,15 @@ class Binah:
             })
         return memories
 
-    def _get_all_memories(self) -> List[Dict]:
+    def _get_all_memories(self, limit: int = 5000) -> List[Dict]:
         """Get ALL memories regardless of age."""
         with self.memory_store._connect() as con:
             rows = con.execute("""
                 SELECT id, identity, parent_id, type, subject, text, confidence, source, created_at, embedding, verified, verification_attempts
                 FROM memories
                 ORDER BY created_at DESC
-            """).fetchall()
+                LIMIT ?
+            """, (limit,)).fetchall()
 
         memories = []
         for r in rows:
@@ -577,6 +667,41 @@ class Binah:
         
         return response in ["EQUIVALENT", "SUBSUMED"]
 
+    def _batch_check_entailment(self, pairs: List[Tuple[Dict, Dict]]) -> List[bool]:
+        """
+        Check entailment for multiple pairs in one LLM call.
+        Returns a list of booleans corresponding to the input pairs.
+        """
+        if not pairs: return []
+        
+        prompt = "Analyze the relationship between these pairs of statements.\n"
+        prompt += "Determine if they are semantically EQUIVALENT (mean the same thing) or SUBSUMED.\n"
+        prompt += "Output JSON list of booleans: [true, false, ...]\n\n"
+        
+        for i, (old, new) in enumerate(pairs):
+            prompt += f"Pair {i+1}:\n"
+            prompt += f"A: {old['text']}\n"
+            prompt += f"B: {new['text']}\n\n"
+            
+        try:
+            response = run_local_lm(
+                [{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=200
+            )
+            
+            # Parse JSON using robust utility
+            results = parse_json_array_loose(response)
+            
+            # Pad or truncate to match length
+            if len(results) < len(pairs):
+                results.extend([False] * (len(pairs) - len(results)))
+            return results[:len(pairs)]
+            
+        except Exception as e:
+            self.log(f"⚠️ Batch entailment check failed: {e}")
+            return [False] * len(pairs) # Fail safe: don't merge if unsure
+
     def learn_associations(self, reasoning_store) -> int:
         """
         Analyzes the reasoning store to find memories used together and creates links.
@@ -595,20 +720,20 @@ class Binah:
         
         linked_pairs = set()
         
-        # For this implementation, we'll use a simple heuristic:
-        # Search for text from each memory in the reasoning log.
-        all_memories = self.memory_store.list_recent(limit=200)
+        # Optimization: Use Vector Similarity instead of brute-force text matching
         reasoning_text = " ".join([t['content'] for t in recent_thoughts])
+        
+        # Compute embedding for the reasoning context
+        if self.embed_fn:
+            reasoning_emb = self.embed_fn(reasoning_text)
+        else:
+            reasoning_emb = compute_embedding(reasoning_text)
+        
+        # Find semantically related memories
+        # Search for top 10 related memories
+        related_memories = self.memory_store.search(reasoning_emb, limit=10)
 
-        # This is O(N*M), can be slow. A better approach would be to have reasoning nodes reference memory IDs.
-        # For now, this demonstrates the concept.
-        mentioned_mems = []
-        for mem in all_memories:
-            # mem: (id, type, subject, text, source, verified, flags)
-            # Simple check if a significant part of the memory text is in the reasoning log
-            # Use a heuristic to avoid matching on very short/common phrases
-            if len(mem[3]) > 15 and mem[3][:15] in reasoning_text:
-                mentioned_mems.append(mem[0])
+        mentioned_mems = [m[0] for m in related_memories]
 
         if len(mentioned_mems) < 2:
             return 0

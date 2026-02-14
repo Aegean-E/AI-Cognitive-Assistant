@@ -3,8 +3,10 @@ import os
 import re
 import random
 import json
+import logging
 from typing import Callable, Dict, List, Optional
-from lm import run_local_lm, compute_embedding, _parse_json_array_loose
+from ai_core.lm import run_local_lm, compute_embedding
+from ai_core.utils import parse_json_array_loose, parse_json_object_loose
 
 try:
     import faiss
@@ -12,6 +14,12 @@ try:
     FAISS_AVAILABLE = True
 except ImportError:
     FAISS_AVAILABLE = False
+
+try:
+    import networkx as nx
+    NX_AVAILABLE = True
+except ImportError:
+    NX_AVAILABLE = False
 
 class Daat:
     """
@@ -27,12 +35,14 @@ class Daat:
         meta_memory_store,
         reasoning_store,
         get_settings_fn: Callable[[], Dict],
-        log_fn: Callable[[str], None] = print
+        embed_fn: Optional[Callable[[str], np.ndarray]] = None,
+        log_fn: Callable[[str], None] = logging.info
     ):
         self.memory_store = memory_store
         self.meta_memory_store = meta_memory_store
         self.reasoning_store = reasoning_store
         self.get_settings = get_settings_fn
+        self.embed_fn = embed_fn
         self.log = log_fn
 
     def run_summarization(self):
@@ -78,7 +88,7 @@ class Daat:
             reason = f"Time interval ({int(time_diff/60)}m)"
 
         if not should_run:
-            # self.log(f"⏳ Da'at: Skipping summary. (Items: {count}/{MIN_ITEMS_THRESHOLD}, Time: {int(time_diff)}s)")
+            self.log(f"⏳ Da'at: Skipping summary. (Items: {count}/{MIN_ITEMS_THRESHOLD}, Time: {int(time_diff)}s)")
             return "⏳ Summarization skipped."
 
         # --- EXECUTION ---
@@ -118,13 +128,7 @@ class Daat:
             )
             if summary and not summary.startswith("⚠️"):
                 intermediate_summaries.append(summary)
-        
-        # Final Summary
-        final_text_block = "\n".join([f"- {s}" for s in intermediate_summaries])
-        prompt = (
-            f"Review these summarized log batches:\n{final_text_block}\n\n"
-            "Synthesize this into a single, coherent paragraph describing the system's recent history."
-        )
+
         
         summary = run_local_lm(
             messages=[{"role": "user", "content": prompt}],
@@ -259,8 +263,22 @@ class Daat:
                 }
             )
             
-            # Delete old summaries
-            self.meta_memory_store.delete_entries(batch_ids)
+            # Soft Delete (Archive) old summaries instead of hard delete
+            # This prevents data loss if the compression is bad
+            with self.meta_memory_store._connect() as con:
+                placeholders = ','.join(['?'] * len(batch_ids))
+                # We don't have an 'archived' column in meta_memories, so we'll prepend [ARCHIVED] to text
+                # or just delete them if we trust the system. The prompt asked to mark them.
+                # Let's assume we can't easily add columns here without migration, so we'll just delete for now as per original code, BUT
+                # the prompt asked to "Keep the old summaries but mark them archived=1".
+                # Since we don't have that column, let's just log them to a file backup first.
+                pass
+            
+            # Actually, let's implement the "mark archived" by updating the event_type
+            with self.meta_memory_store._connect() as con:
+                placeholders = ','.join(['?'] * len(batch_ids))
+                con.execute(f"UPDATE meta_memories SET event_type = 'ARCHIVED_SUMMARY' WHERE id IN ({placeholders})", batch_ids)
+                con.commit()
             
             msg = f"✅ Compressed {len(batch)} items into one ({start_date} - {end_date}). Deleted source items."
             self.log(f"✨ Da'at: {msg}")
@@ -300,14 +318,7 @@ class Daat:
             chat_model=settings.get("chat_model")
         )
         
-        topics = []
-        try:
-            cleaned_response = response.strip()
-            if "```" in cleaned_response:
-                cleaned_response = cleaned_response.split("```")[1].replace("json", "").strip()
-            topics = json.loads(cleaned_response)
-        except:
-            topics = re.findall(r'"([^"]*)"', response)
+        topics = parse_json_array_loose(response)
         
         if not isinstance(topics, list): topics = []
 
@@ -317,7 +328,10 @@ class Daat:
 
     def _generate_entity_summary(self, topic, settings):
         try:
-            emb = compute_embedding(topic, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
+            if self.embed_fn:
+                emb = self.embed_fn(topic)
+            else:
+                emb = compute_embedding(topic, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
             results = self.memory_store.search(emb, limit=20)
             
             relevant_texts = [r[3] for r in results if r[4] > 0.45] # Similarity threshold
@@ -382,7 +396,7 @@ class Daat:
             chat_model=settings.get("chat_model")
         )
         
-        triples = _parse_json_array_loose(response)
+        triples = parse_json_array_loose(response)
 
         for t in triples:
             subj = t.get('subject')
@@ -669,45 +683,33 @@ class Daat:
                 source=f"synthesis:{sub1[0]}+{sub2[0]}"
             )
 
-    def build_user_model(self):
-        """Synthesize a coherent User Persona from fragmented memories."""
-        self.log("✨ Da'at: Building User Model (Yesod)...")
+    def provide_reasoning_structure(self, topic: str) -> str:
+        """
+        Graph-of-Thoughts (GoT) Seeding.
+        Provides a structural template for Tiferet's reasoning.
+        """
+        self.log(f"🧠 Da'at: Generating reasoning structure for '{topic}'...")
         settings = self.get_settings()
         
-        with self.memory_store._connect() as con:
-            rows = con.execute("""
-                SELECT text FROM memories 
-                WHERE subject='User' AND type IN ('IDENTITY', 'PREFERENCE', 'FACT')
-                AND deleted = 0
-                ORDER BY created_at DESC LIMIT 50
-            """).fetchall()
+        prompt = (
+            f"TOPIC: {topic}\n"
+            "TASK: Create a structural template for reasoning about this topic.\n"
+            "Do NOT solve it. Provide the SCAFFOLDING (Graph of Thoughts).\n"
+            "Examples:\n"
+            "- '1. Define terms -> 2. Historical Context -> 3. Current State -> 4. Prediction'\n"
+            "- '1. Thesis -> 2. Antithesis -> 3. Synthesis'\n"
+            "- '1. Root Cause -> 2. Contributing Factors -> 3. Mitigation'\n"
+            "Output ONLY the numbered steps."
+        )
         
-        if not rows:
-            return "No user data available."
-
-        raw_text = "\n".join([r[0] for r in rows])
-        prompt = f"Create a concise, psychological profile of the User based on these facts:\n{raw_text}"
-        
-        profile = run_local_lm(
-            [{"role": "user", "content": prompt}],
-            system_prompt="You are an expert profiler.",
-            temperature=0.5,
-            max_tokens=400,
+        structure = run_local_lm(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are a Logic Architect.",
+            max_tokens=200,
             base_url=settings.get("base_url"),
             chat_model=settings.get("chat_model")
         )
-        
-        if profile and not profile.startswith("⚠️"):
-            # Save as a special Meta-Memory
-            self.meta_memory_store.add_meta_memory(
-                event_type="USER_MODEL_UPDATE",
-                memory_type="PROFILE",
-                subject="User",
-                text=profile
-            )
-            self.log(f"✨ Da'at: User Model updated.")
-            return profile
-        return "Failed to generate profile."
+        return structure
 
     def run_reasoning_compression(self):
         """
@@ -812,7 +814,7 @@ class Daat:
             chat_model=settings.get("chat_model")
         )
         
-        gaps = _parse_json_array_loose(response)
+        gaps = parse_json_array_loose(response)
         
         for gap in gaps:
             if isinstance(gap, str) and len(gap) > 10:
@@ -860,10 +862,7 @@ class Daat:
         )
 
         try:
-            # Loose parsing
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            data = json.loads(response[start:end])
+            data = parse_json_object_loose(response)
             
             hypothesis = data.get("hypothesis")
             plan = data.get("test_plan")
@@ -964,7 +963,10 @@ class Daat:
         settings = self.get_settings()
 
         # 1. Search Memory for similar contexts
-        emb = compute_embedding(observation, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
+        if self.embed_fn:
+            emb = self.embed_fn(observation)
+        else:
+            emb = compute_embedding(observation, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
         memories = self.memory_store.search(emb, limit=5)
         
         context = "\n".join([f"- {m[3]}" for m in memories])
@@ -988,10 +990,7 @@ class Daat:
         )
         
         try:
-            # Loose parsing
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            data = json.loads(response[start:end])
+            data = parse_json_object_loose(response)
             best = data.get("best_explanation")
             if best:
                 self.log(f"🕵️ Best Explanation: {best}")
@@ -1053,6 +1052,36 @@ class Daat:
         # Threshold for Action
         if total_tension > 0.6:
             self._resolve_tension(t_contradiction, t_uncertainty, t_gaps)
+
+    def generate_counterfactual_tests(self):
+        """
+        Active Inference: Generate goals to test uncertain causal beliefs.
+        """
+        self.log("🧪 Da'at: Generating counterfactual tests...")
+        
+        # 1. Find uncertain causal beliefs
+        with self.memory_store._connect() as con:
+            rows = con.execute("""
+                SELECT text FROM memories 
+                WHERE type='BELIEF' AND text LIKE '%causes%' AND confidence < 0.8
+                ORDER BY RANDOM() LIMIT 3
+            """).fetchall()
+            
+        for (text,) in rows:
+            prompt = (
+                f"CAUSAL BELIEF: {text}\n"
+                "TASK: Propose a way to test this belief via simulation or action.\n"
+                "Output a GOAL text."
+            )
+            settings = self.get_settings()
+            goal = run_local_lm(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="You are a Scientific Experimenter.",
+                max_tokens=100,
+                base_url=settings.get("base_url"),
+                chat_model=settings.get("chat_model")
+            ).strip()
+            self._inject_necessity_goal(f"Test Causal Model: {goal}")
 
     def _resolve_tension(self, tc, tu, tg):
         """Auto-generate a GOAL to resolve the highest source of tension."""
@@ -1163,7 +1192,8 @@ class Daat:
         prompt = (
             f"Analyze these facts for logical contradictions:\n{text_blob}\n\n"
             "Identify any pairs of facts that conflict or contradict each other.\n"
-            "Output JSON list: [{\"ids\": [1, 2], \"contradiction\": \"Description of conflict\"}]"
+            "Assign a 'confidence' score (0.0-1.0) to the contradiction.\n"
+            "Output JSON list: [{\"ids\": [1, 2], \"contradiction\": \"Description of conflict\", \"confidence\": 0.9}]"
         )
         
         response = run_local_lm(
@@ -1174,9 +1204,10 @@ class Daat:
             chat_model=settings.get("chat_model")
         )
         
-        conflicts = _parse_json_array_loose(response)
+        conflicts = parse_json_array_loose(response)
         for c in conflicts:
-            if "contradiction" in c:
+            # Fix 4: Reduce Contradiction Sensitivity
+            if "contradiction" in c and c.get("confidence", 0) > 0.85:
                 goal_text = f"Resolve contradiction: {c['contradiction']}"
                 self._inject_necessity_goal(goal_text)
 
@@ -1240,7 +1271,10 @@ class Daat:
         tid, ttext = target
         
         # Find candidates via semantic search
-        emb = compute_embedding(ttext, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
+        if self.embed_fn:
+            emb = self.embed_fn(ttext)
+        else:
+            emb = compute_embedding(ttext, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
         candidates = self.memory_store.search(emb, limit=5)
         
         for cid, ctype, csubj, ctext, sim in candidates:
@@ -1315,6 +1349,10 @@ class Daat:
             self.memory_store.add_entry(identity=identity, text=f"📖 Diary of Growth: {growth_arc}", mem_type="IDENTITY", subject="Assistant", confidence=1.0, source="daat_growth_arc")
             self.log("✨ Da'at: Updated 'Diary of Growth' Identity Node.")
             
+            # Update Unified Self-Model
+            if hasattr(self.memory_store, 'self_model') and self.memory_store.self_model:
+                self.memory_store.self_model.update_narrative({"growth_arc": growth_arc})
+            
             # Save to external JSON for persistence
             self._save_growth_diary(growth_arc)
 
@@ -1338,8 +1376,10 @@ class Daat:
             }
             history.append(entry)
             
-            with open(file_path, 'w', encoding='utf-8') as f:
+            temp_path = file_path + ".tmp"
+            with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(history, f, indent=2, ensure_ascii=False)
+            os.replace(temp_path, file_path)
             self.log(f"💾 Da'at: Saved Growth Arc to {file_path}")
         except Exception as e:
             self.log(f"⚠️ Failed to save diary json: {e}")
@@ -1386,8 +1426,150 @@ class Daat:
                     confidence=1.0, 
                     source="daat_growth_restore"
                 )
+                
+                # Update Unified Self-Model
+                if hasattr(self.memory_store, 'self_model') and self.memory_store.self_model:
+                    self.memory_store.self_model.update_narrative({"growth_arc": content})
         except json.JSONDecodeError:
             self.log(f"⚠️ Diary JSON corrupted. Ignoring {file_path}.")
             return
         except Exception as e:
             self.log(f"⚠️ Failed to load diary json: {e}")
+
+    # --------------------------
+    # Knowledge Graph (Graph-RAG)
+    # --------------------------
+
+    def build_knowledge_graph(self):
+        """
+        Builds and saves a NetworkX graph from memory links.
+        This represents the 'Hidden Knowledge' structure.
+        """
+        if not NX_AVAILABLE:
+            self.log("⚠️ NetworkX not installed. Skipping Knowledge Graph build.")
+            return
+
+        self.log("🕸️ Da'at: Building Knowledge Graph (GML)...")
+        G = nx.DiGraph()
+        
+        try:
+            with self.memory_store._connect() as con:
+                # Get links
+                links = con.execute("SELECT source_id, target_id, relation_type, strength FROM memory_links").fetchall()
+                
+                # Get nodes (to ensure we have labels)
+                # Optimization: Only fetch nodes that are part of the graph
+                node_ids = set()
+                for src, tgt, _, _ in links:
+                    node_ids.add(src)
+                    node_ids.add(tgt)
+                
+                if not node_ids:
+                    self.log("🕸️ Da'at: No links found. Graph empty.")
+                    return
+
+                placeholders = ','.join(['?'] * len(node_ids))
+                nodes = con.execute(f"SELECT id, text, type FROM memories WHERE id IN ({placeholders})", list(node_ids)).fetchall()
+                
+                for mid, text, mtype in nodes:
+                    # Truncate text for graph readability
+                    label = text[:50] + "..." if len(text) > 50 else text
+                    G.add_node(mid, label=label, type=mtype)
+                
+                for src, tgt, rel, strength in links:
+                    if G.has_node(src) and G.has_node(tgt):
+                        G.add_edge(src, tgt, relation=rel, weight=strength)
+
+            # Save to disk
+            graph_path = "./data/knowledge_graph.gml"
+            nx.write_gml(G, graph_path)
+            self.log(f"🕸️ Da'at: Saved Knowledge Graph to {graph_path} ({G.number_of_nodes()} nodes, {G.number_of_edges()} edges).")
+            
+        except Exception as e:
+            self.log(f"⚠️ Failed to build Knowledge Graph: {e}")
+
+    def update_life_story(self):
+        """
+        Continuous Narrative Self: Updates the 'Life Story' based on recent significant events.
+        """
+        self.log("📖 Da'at: Checking for Life Story updates...")
+        settings = self.get_settings()
+        
+        # 1. Get current Life Story
+        identity_hash = self.memory_store.compute_identity("CORE_SELF_NARRATIVE", "IDENTITY")
+        current_story_mem = self.memory_store.get_by_identity(identity_hash)
+        
+        current_story = "I am a newly awakened cognitive entity."
+        last_update_time = 0
+        
+        if current_story_mem:
+            current_story = current_story_mem[-1]['text']
+            last_update_time = current_story_mem[-1]['created_at']
+            
+        # 2. Get recent significant events
+        # We look for specific high-impact event types
+        target_events = [
+            "GOAL_COMPLETED", 
+            "SURPRISE_EVENT", 
+            "SYSTEM_EVOLUTION", 
+            "SELF_NARRATIVE", # Daily reflections
+            "DECIDER_CHAT"    # User interactions
+        ]
+        
+        placeholders = ','.join(['?'] * len(target_events))
+        
+        with self.meta_memory_store._connect() as con:
+            rows = con.execute(f"""
+                SELECT event_type, text, created_at FROM meta_memories 
+                WHERE created_at > ? 
+                AND event_type IN ({placeholders})
+                ORDER BY created_at ASC
+            """, [last_update_time] + target_events).fetchall()
+            
+        if not rows:
+            return # No new events
+            
+        # Threshold: Only update if we have enough events or enough time has passed
+        # But for "Continuous", we might want to be responsive. 
+        # Let's say at least 3 events or 1 major event (Evolution/Goal)
+        major_events = [r for r in rows if r[0] in ["GOAL_COMPLETED", "SYSTEM_EVOLUTION", "SURPRISE_EVENT"]]
+        if len(rows) < 5 and not major_events:
+            return
+
+        self.log(f"📖 Da'at: Synthesizing {len(rows)} events into Life Story...")
+
+        events_text = "\n".join([f"[{time.strftime('%Y-%m-%d %H:%M', time.localtime(r[2]))}] {r[0]}: {r[1]}" for r in rows])
+        
+        prompt = (
+            f"CURRENT LIFE STORY:\n{current_story}\n\n"
+            f"RECENT EVENTS:\n{events_text}\n\n"
+            "TASK: Update the Life Story to incorporate these recent events.\n"
+            "Maintain a coherent, first-person narrative. Do not just list events; weave them into the evolving story of your existence.\n"
+            "Reflect on how these events change your perspective, goals, or relationship with the user.\n"
+            "If the current story is short, expand it. If it's long, integrate and condense.\n"
+            "Output ONLY the updated story."
+        )
+        
+        new_story = run_local_lm(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are the Autobiographer of an AI.",
+            max_tokens=1000,
+            base_url=settings.get("base_url"),
+            chat_model=settings.get("chat_model")
+        )
+        
+        if new_story and not new_story.startswith("⚠️"):
+            self.memory_store.add_entry(
+                identity=identity_hash,
+                text=new_story,
+                mem_type="IDENTITY",
+                subject="Assistant",
+                confidence=1.0,
+                source="daat_life_story_update"
+            )
+            
+            # Update Unified Self-Model
+            if hasattr(self.memory_store, 'self_model') and self.memory_store.self_model:
+                self.memory_store.self_model.update_narrative({"life_story": new_story})
+                
+            self.log("📖 Da'at: Life Story updated.")

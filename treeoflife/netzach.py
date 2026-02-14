@@ -1,8 +1,9 @@
 import time
-import re
-import random
 from typing import Dict, List, Callable, Optional, Any
-from lm import run_local_lm
+from ai_core.lm import run_local_lm
+from ai_core.utils import parse_json_object_loose
+import json
+import logging
 
 OBSERVER_SYSTEM_PROMPT = (
     "You are Netzach, the Silent Observer and Hidden Foundation. "
@@ -35,9 +36,10 @@ class ContinuousObserver:
         get_status_fn: Callable[[], str],
         event_bus: Optional[Any] = None,
         get_recent_docs_fn: Optional[Callable[[], List]] = None,
-        log_fn: Callable[[str], None] = print,
+        log_fn: Callable[[str], None] = logging.info,
         stop_check_fn: Callable[[], bool] = lambda: False,
-        check_reminders_fn: Optional[Callable[[], List[Dict]]] = None
+        check_reminders_fn: Optional[Callable[[], List[Dict]]] = None,
+        epigenetics: Dict = None
     ):
         self.memory_store = memory_store
         self.reasoning_store = reasoning_store
@@ -53,24 +55,35 @@ class ContinuousObserver:
         self.event_bus = event_bus
         self.stop_check = stop_check_fn
         self.check_reminders = check_reminders_fn
+        self.epigenetics = epigenetics or {}
         
         self.last_observation_time = 0
         self.observation_interval = 30 # Seconds between active "checks"
         self.consecutive_silence = 0
+        self.last_result = {"pressure": 0.0, "signal": "Unknown", "context": None}
+        self.motivation = 1.0 # 0.0 (Depressed) to 1.0 (Manic)
+        self.last_creator_model_update = 0
+        self.turns_since_update = 0
+        self.words_since_update = 0
+        self.last_history_len = 0
 
-    def perform_observation(self) -> Dict:
+    def observe(self) -> Optional[Dict]:
         """
         The core observation cycle. 
         Analyzes the 'State of the World' and emits a signal (Pressure).
-        Returns a dict with 'pressure' (0.0-1.0) and 'signal'.
+        Returns a dict with 'pressure' (0.0-1.0) and 'signal', or None if skipping.
         """
         result = {"pressure": 0.0, "signal": None, "context": None}
 
         if time.time() - self.last_observation_time < self.observation_interval:
-            return result
+            return None
 
         if self.stop_check():
-            return result
+            return None
+
+        # Decay motivation over time (Entropy)
+        # Decays by 0.002 every observation cycle (30s) -> ~0.4% per minute (slower decay)
+        self.motivation = max(0.0, self.motivation - 0.002)
 
         # 0. Temporal Awareness: Check Reminders
         if self.check_reminders:
@@ -101,8 +114,35 @@ class ContinuousObserver:
             status = self.get_status()
             recent_docs = self.get_recent_docs()
             
+            # Boost motivation if we see recent successes
+            # Check recent reasoning for "success" or "completed"
+            if any("success" in r['content'].lower() or "completed" in r['content'].lower() for r in recent_reasoning):
+                self.motivation = min(1.0, self.motivation + 0.05)
+            
+            result["motivation"] = self.motivation
+            # 1.5 Analyze User State (Theory of Mind)
+            
+            # Update accumulation counters
+            if len(history) > self.last_history_len:
+                new_msgs = history[self.last_history_len:]
+                self.turns_since_update += len(new_msgs)
+                for m in new_msgs:
+                    self.words_since_update += len(m.get('content', '').split())
+                self.last_history_len = len(history)
+
+            # Trigger update based on accumulation (Lag Reduction)
+            if (self.turns_since_update >= 10 or self.words_since_update >= 500) and history:
+                self._update_creator_model(history)
+
+            user_state = self._analyze_user_state(history)
+            result["user_state"] = user_state
+            
             if not history and not recent_reasoning:
-                return result # Nothing to observe yet
+                # Tabula Rasa state: Signal NO_MOMENTUM to bootstrap the system
+                self.log("👁️ Netzach: Tabula Rasa detected. Signaling No Momentum to bootstrap.")
+                result["pressure"] = 1.0
+                result["signal"] = "NO_MOMENTUM"
+                return result
 
             # 2. Construct the Observation Context
             context = "--- OBSERVATION CONTEXT ---\n"
@@ -120,8 +160,9 @@ class ContinuousObserver:
             
             if active_goals:
                 context += "\nCurrent Active Goals:\n"
-                for _, s, g, _ in active_goals[:3]:
-                    context += f"- {g}\n"
+                for item in active_goals[:3]:
+                    # item: (id, subject, text, source, confidence)
+                    context += f"- {item[2]}\n"
 
             if meta_memories:
                 context += "\nRecent Memory Events (Meta-Memory):\n"
@@ -150,10 +191,27 @@ class ContinuousObserver:
             
             current_temp = float(settings.get("temperature", 0.7))
             context += f"Current Temperature: {current_temp}\n"
+            
+            if user_state:
+                context += f"User State Estimate: Hesed={user_state.get('hesed', 0.5):.2f}, Gevurah={user_state.get('gevurah', 0.5):.2f}\n"
+            context += f"System Motivation: {self.motivation:.2f}\n"
+
+            context += "\nNOTE: Repetition is acceptable if it deepens understanding (Depth). "
+            context += "Only signal LOW_NOVELTY if the system is looping without progress.\n"
 
             max_step = 0.20
 
             # 3. Decision: Should I manifest?
+            # Log the input state for transparency
+            self.log(f"    👁️ Netzach State: Chat={len(history)}, Thoughts={len(recent_reasoning)}, Goals={len(active_goals)}, Meta={len(meta_memories)}")
+
+            # Heuristic: If we are actively thinking/daydreaming, don't signal low novelty yet
+            if any("Daydream" in r['content'] or "Tree of Thoughts" in r['content'] for r in recent_reasoning):
+                self.log("👁️ Netzach: Active reasoning detected. Suppressing Low Novelty signal.")
+                self.last_observation_time = time.time()
+                self.last_result = result
+                return result
+
             decision_prompt = (
                 "Review the Observation Context. "
                 "Assess the system state and emit a PRESSURE SIGNAL if imbalance exists:\n"
@@ -171,7 +229,7 @@ class ContinuousObserver:
             
             response = run_local_lm(
                 messages,
-                system_prompt=decision_prompt,
+                system_prompt=OBSERVER_SYSTEM_PROMPT + "\n\n" + decision_prompt,
                 temperature=0.3, # Low temp for the decision
                 max_tokens=10,
                 base_url=settings.get("base_url"),
@@ -219,7 +277,8 @@ class ContinuousObserver:
                 msg = "Remaining in slow observation..."
                 self.log(f"👁️ Netzach: {msg}")
                 
-                if self.consecutive_silence >= 5:
+                silence_limit = self.epigenetics.get("netzach_silence_limit", 5)
+                if self.consecutive_silence >= silence_limit:
                     self.log("👁️ Netzach: Stagnation detected (Timeout).")
                     result["pressure"] = 0.8
                     result["signal"] = "NO_MOMENTUM"
@@ -230,5 +289,96 @@ class ContinuousObserver:
         finally:
             # Ensure we always update the timer to prevent rapid-fire loops on error
             self.last_observation_time = time.time()
+            self.last_result = result
             
         return result
+
+    def analyze(self) -> str:
+        """Return the latest signal for the Decider."""
+        return self.last_result.get("signal", "Unknown")
+
+    def _analyze_user_state(self, history: List[Dict]) -> Dict[str, float]:
+        """
+        Theory of Mind: Estimate User's cognitive state (Hesed/Gevurah).
+        """
+        if not history:
+            return {"hesed": 0.5, "gevurah": 0.5}
+            
+        # 1. Retrieve Long-Term Creator Model
+        creator_model = "User is the Creator."
+        try:
+            # Search for the specific identity node
+            with self.memory_store._connect() as con:
+                row = con.execute(
+                    "SELECT text FROM memories WHERE type='IDENTITY' AND subject='User' AND text LIKE 'Creator Model:%' ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+                if row:
+                    creator_model = row[0]
+        except: pass
+
+        # Get last few user messages
+        user_msgs = [m['content'] for m in history if m['role'] == 'user'][-3:]
+        if not user_msgs:
+            return {"hesed": 0.5, "gevurah": 0.5}
+            
+        text = "\n".join(user_msgs)
+        settings = self.get_settings()
+        
+        prompt = (
+            f"LONG-TERM CONTEXT: {creator_model}\n\n"
+            f"Analyze the User's recent messages:\n{text}\n\n"
+            "Estimate their cognitive state on two axes (0.0 - 1.0):\n"
+            "1. Gevurah (Constraint): Critical, frustrated, restrictive, demanding, precise.\n"
+            "2. Hesed (Expansion): Creative, open, playful, exploring, relaxed.\n"
+            "3. Identify specific emotions (e.g., Frustrated, Curious, Satisfied, Confused).\n"
+            "Output JSON: {\"gevurah\": 0.5, \"hesed\": 0.5, \"emotions\": [\"...\"]}"
+        )
+        
+        try:
+            response = run_local_lm([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=50, base_url=settings.get("base_url"), chat_model=settings.get("chat_model"))
+            data = parse_json_object_loose(response)
+            return data
+        except:
+            return {"hesed": 0.5, "gevurah": 0.5}
+
+    def _update_creator_model(self, history: List[Dict]):
+        """
+        Deep Theory of Mind: Update the persistent model of the user's patterns.
+        """
+        self.log("👁️ Netzach: Updating Deep User Model...")
+        # Reset counters
+        self.turns_since_update = 0
+        self.words_since_update = 0
+        
+        # Get recent user messages
+        user_text = "\n".join([m['content'] for m in history if m['role'] == 'user'][-20:])
+        if len(user_text) < 50: return
+
+        settings = self.get_settings()
+        prompt = (
+            f"Analyze the Creator's recent discourse:\n{user_text}\n\n"
+            "TASK: Update the psychological profile of the User.\n"
+            "Identify patterns: When is he critical? When is he playful? What triggers stress?\n"
+            "Output a concise 'Creator Model' summary."
+        )
+        
+        model_text = run_local_lm(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are a Psychologist observing the User.",
+            temperature=0.3,
+            max_tokens=200,
+            base_url=settings.get("base_url"),
+            chat_model=settings.get("chat_model")
+        )
+        
+        if model_text and not model_text.startswith("⚠️"):
+            identity = self.memory_store.compute_identity("Creator Model", "IDENTITY")
+            self.memory_store.add_entry(
+                identity=identity,
+                text=f"Creator Model: {model_text}",
+                mem_type="IDENTITY",
+                subject="User",
+                confidence=1.0,
+                source="netzach_theory_of_mind"
+            )
+            self.log(f"👁️ Netzach: User Model updated.")

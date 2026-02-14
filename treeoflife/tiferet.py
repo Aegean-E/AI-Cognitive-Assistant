@@ -2,16 +2,17 @@ import re
 import ast
 import time
 import random
+import json
+import traceback
 import platform
 import operator
-import difflib
-import os
 import threading
-import numpy as np
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Callable, Dict, Any, Optional, List
-from lm import compute_embedding, run_local_lm, extract_memory_candidates, DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT, _parse_json_array_loose
+from ai_core.lm import compute_embedding, run_local_lm, extract_memory_candidates, DEFAULT_SYSTEM_PROMPT, DEFAULT_MEMORY_EXTRACTOR_PROMPT
+from ai_core.utils import parse_json_array_loose
 
 try:
     import psutil
@@ -22,6 +23,8 @@ class Decider:
     """
     Autonomous decision module.
     Controls system parameters (Temperature) and operational modes (Daydream, Verification).
+    
+    LOCK HIERARCHY: Level 3 (Logic/Flow) - planning_lock, maintenance_lock
     """
     def __init__(
         self,
@@ -33,7 +36,7 @@ class Decider:
         arbiter,
         meta_memory_store,
         actions: Dict[str, Callable[[], None]],
-        log_fn: Callable[[str], None] = print,
+        log_fn: Callable[[str], None] = logging.info,
         chat_fn: Optional[Callable[[str, str], None]] = None,
         get_chat_history_fn: Optional[Callable[[], List[Dict]]] = None,
         event_bus: Optional[Any] = None,
@@ -45,7 +48,18 @@ class Decider:
         binah=None,
         dialectics=None,
         keter=None,
-        malkuth=None
+        daat=None,
+        malkuth=None,
+        yesod=None,
+        temp_step: float = 0.20,
+        token_step: float = 0.20,
+        crs=None,
+        epigenetics: Dict = None,
+        value_core=None,
+        stability_controller=None,
+        heartbeat=None,
+        global_workspace=None,
+        executor=None
     ):
         self.get_settings = get_settings_fn
         self.update_settings = update_settings_fn
@@ -67,33 +81,61 @@ class Decider:
         self.binah = binah
         self.dialectics = dialectics
         self.keter = keter
+        self.daat = daat
         self.malkuth = malkuth
-        self.cycle_count = 0
+        self.yesod = yesod
+        self.crs = crs
+        self.value_core = value_core
+        self.stability_controller = stability_controller
+        self.epigenetics = epigenetics or {}
+        self.meta_learner = None # Set via property later
+        self.temp_step = temp_step
+        self.token_step = token_step
+        self.heartbeat = heartbeat
+        self.global_workspace = global_workspace
+        self.executor = executor
         self.hod_just_ran = False
         self.action_taken_in_observation = False
-        self.cycles_remaining = 0
-        self.current_task = "wait"  # wait, daydream, verify
         self.last_action_was_speak = False
         self.forced_stop_cooldown = False
         self.daydream_mode = "auto" # auto, read, insight
         self.daydream_topic = None
         self.last_tool_usage = 0
         self.consecutive_daydream_batches = 0
-        self.wait_start_time = 0
         self.last_daydream_time = 0
         self.last_token_adjustment_time = 0
         self.planning_lock = threading.Lock()
+        self.maintenance_lock = threading.Lock()
         self.pending_maintenance = [] # List of actions recommended by Hod
         self.latest_netzach_signal = None
+        self.last_goal_management_time = 0
+        self.command_history = [] # For deadlock detection
+        self.last_predicted_delta = 0.0 # Track prediction for error calculation
+        self.interrupted = False # Flag for interrupt-priority architecture
+        self.panic_mode = False
+        self.is_sleeping = False
+        self.stream_of_consciousness = [] # Injected by AIController
+        self.last_internal_thought = None
+        self.thought_history = [] # Track recent thoughts to prevent loops
+        self.last_simulation_time = 0
+        self.last_utility_log_time = 0
+        self.last_utility_score = 0.0
         
         # Capture baselines for relative limits
         settings = self.get_settings()
         self.baseline_temp = float(settings.get("default_temperature", 0.7))
         self.baseline_tokens = int(settings.get("default_max_tokens", 800))
 
+        # Affective State (Emotional Bias)
+        self.mood = float(settings.get("current_mood", 0.5)) # 0.0 (Depressed) to 1.0 (Manic)
+
+        # Subscribe to Conscious Content
+        if self.event_bus:
+            self.event_bus.subscribe("CONSCIOUS_CONTENT", self._on_conscious_content, priority=10)
+
     def increase_temperature(self, amount: float = None):
         """Increase temperature by specified amount (percentage) up to 20%."""
-        limit_pct = 0.20
+        limit_pct = self.temp_step
         if amount is None:
             amount = limit_pct
         step = max(0.01, min(float(amount), limit_pct))
@@ -101,7 +143,7 @@ class Decider:
 
     def decrease_temperature(self, amount: float = None):
         """Decrease temperature by specified amount (percentage) up to 20%."""
-        limit_pct = 0.20
+        limit_pct = self.temp_step
         if amount is None:
             amount = limit_pct
         step = max(0.01, min(float(amount), limit_pct))
@@ -112,7 +154,7 @@ class Decider:
         current = float(settings.get("temperature", 0.7))
         new_temp = round(current * multiplier, 2)
         
-        limit_pct = 0.20
+        limit_pct = self.temp_step
         
         # Calculate bounds based on BASELINE, not current
         lower_bound = self.baseline_temp * (1.0 - limit_pct)
@@ -133,9 +175,20 @@ class Decider:
                 text=f"Adjusted temperature to {new_temp}"
             )
 
+    def _update_mood(self, delta: float):
+        """Update affective state based on success/failure."""
+        # Dampened update
+        self.mood = max(0.0, min(1.0, self.mood + (delta * 0.2)))
+        
+        # Persist
+        settings = self.get_settings()
+        settings["current_mood"] = self.mood
+        self.update_settings(settings)
+        self.log(f"🧠 Decider Mood: {self.mood:.2f} (Δ={delta:+.2f})")
+
     def increase_tokens(self, amount: float = None):
         """Increase max_tokens by specified amount (percentage) up to 20%."""
-        limit_pct = 0.20
+        limit_pct = self.token_step
         if amount is None:
             amount = limit_pct
         step = max(0.01, min(float(amount), limit_pct))
@@ -143,7 +196,7 @@ class Decider:
 
     def decrease_tokens(self, amount: float = None):
         """Decrease max_tokens by specified amount (percentage) up to 20%."""
-        limit_pct = 0.20
+        limit_pct = self.token_step
         if amount is None:
             amount = limit_pct
         step = max(0.01, min(float(amount), limit_pct))
@@ -154,7 +207,7 @@ class Decider:
         current = int(settings.get("max_tokens", 800))
         new_tokens = int(current * multiplier)
         
-        limit_pct = 0.20
+        limit_pct = self.token_step
         
         # Calculate bounds based on BASELINE
         lower_bound = int(self.baseline_tokens * (1.0 - limit_pct))
@@ -162,7 +215,7 @@ class Decider:
         
         new_tokens = max(lower_bound, min(new_tokens, upper_bound))
         # Absolute safety floor
-        new_tokens = max(1024, new_tokens)
+        new_tokens = int(max(1024, new_tokens))
         
         settings["max_tokens"] = new_tokens
         self.update_settings(settings)
@@ -175,11 +228,15 @@ class Decider:
                 subject="Assistant",
                 text=f"Adjusted max_tokens to {new_tokens}"
             )
+            
+    def set_meta_learner(self, meta_learner):
+        """Dependency injection for Meta-Learner."""
+        self.meta_learner = meta_learner
 
     def start_daydream(self):
         self.log("🤖 Decider starting single Daydream cycle.")
-        self.current_task = "daydream"
-        self.cycles_remaining = 1
+        if self.heartbeat:
+            self.heartbeat.force_task("daydream", 1, "Manual Command")
         if time.time() - self.last_daydream_time < 60:
             self.daydream_mode = "insight"
         else:
@@ -187,48 +244,45 @@ class Decider:
 
     def start_verification_batch(self):
         self.log("🤖 Decider starting Verification Batch.")
-        self.current_task = "verify"
-        self.cycles_remaining = 1
+        if self.heartbeat:
+            self.heartbeat.force_task("verify", 1, "Manual Command")
 
     def verify_all(self):
         self.log("🤖 Decider starting Full Verification.")
-        self.current_task = "verify_all"
-        self.cycles_remaining = 1
+        if self.heartbeat:
+            self.heartbeat.force_task("verify_all", 1, "Manual Command")
 
     def start_daydream_loop(self):
         self.log("🤖 Decider enabling Daydream Loop.")
-        self._run_action("start_loop")
-        self.current_task = "daydream"
+        self._run_action("start_loop", reason="User command")
         settings = self.get_settings()
-        self.cycles_remaining = int(settings.get("daydream_cycle_limit", 10))
+        if self.heartbeat:
+            self.heartbeat.force_task("daydream", int(settings.get("daydream_cycle_limit", 10)), "User Loop Command")
         self.last_daydream_time = time.time()
 
     def stop_daydream(self):
         self.log("🤖 Decider stopping daydream.")
-        self._run_action("stop_daydream")
+        self._run_action("stop_daydream", reason="User command or Stop signal")
 
     def report_forced_stop(self):
         """Handle forced stop from UI."""
         self.log("🤖 Decider: Forced stop received. Entering cooldown.")
-        self.cycles_remaining = 0
+        if self.heartbeat:
+            self.heartbeat.stop()
         self.forced_stop_cooldown = True
 
     def wake_up(self, reason: str = "External Stimulus"):
         """Force the Decider to wake up from a wait state."""
+        self.is_sleeping = False
         self.log(f"🤖 Decider: Waking up due to {reason}.")
-        self.current_task = "waking_up"
-        self.cycles_remaining = 0
+        if self.heartbeat:
+            self.heartbeat.force_task("organizing", 0, reason)
 
     def create_note(self, content: str):
         """Manually create an Assistant Note (NOTE)."""
         if self.malkuth:
             return self.malkuth.create_note(content)
         self.log("⚠️ Malkuth not available for creating note.")
-
-    def edit_note(self, mem_id: int, content: str):
-        """Edit an Assistant Note by superseding it."""
-        if self.malkuth:
-            self.malkuth.edit_note(mem_id, content)
 
     def _on_reminder_due(self, event):
         """Handles REMINDER_DUE event from Netzach."""
@@ -237,6 +291,30 @@ class Decider:
             self.log(f"⏰ Decider received reminder: {reminder_text}")
             if self.chat_fn:
                 self.chat_fn("Assistant", f"⏰ Reminder: {reminder_text}")
+
+    def on_panic(self, event):
+        """Handle SYSTEM:PANIC event from Keter."""
+        self.log("🚨 Decider: PANIC PROTOCOL INITIATED. Halting all non-essential tasks.")
+        self.panic_mode = True
+        self.current_task = "wait"
+        self.cycles_remaining = 0
+        if self.heartbeat:
+            self.heartbeat.stop()
+        # Force a full reset/reboot thought
+        self.reasoning_store.add(content="SYSTEM PANIC: I must stop and reorganize. My thoughts are incoherent.", source="keter_panic", confidence=1.0)
+
+    def _on_conscious_content(self, event):
+        """Handle high-salience events from Global Workspace."""
+        data = event.data
+        salience = data.get("salience", 0.0)
+        content = data.get("content", "")
+        
+        if salience > 0.9:
+            self.log(f"🔦 Decider: High Salience Event ({salience:.2f}): {content}. Interrupting.")
+            # If we are daydreaming, stop and attend
+            if self.heartbeat and self.heartbeat.current_task == "daydream":
+                self.stop_daydream()
+                self.wake_up(f"High Salience: {content}")
 
     def create_goal(self, content: str):
         """Autonomously create a new GOAL memory."""
@@ -255,89 +333,306 @@ class Decider:
         if hasattr(self.meta_memory_store, 'add_event'):
             self.meta_memory_store.add_event("GOAL_CREATED", "Assistant", f"Created Goal: {content}")
         return mid
+        
+    def _track_metric(self, metric: str, value: float):
+        if self.meta_learner:
+            self.meta_learner.track(metric, value)
 
     def run_post_chat_decision_cycle(self):
         """Initiates the decision process after a chat interaction is complete."""
         # This is called after a chat reply has been sent.
-        # If a natural language command already set up a task (cycles > 0), don't overwrite it.
-        if self.cycles_remaining > 0 and self.current_task != "wait":
-            self.log(f"🤖 Decider: Chat complete. Resuming assigned task ({self.current_task}).")
+        # If a natural language command already set up a task, don't overwrite it.
+        if self.heartbeat and self.heartbeat.cycles_remaining > 0 and self.heartbeat.current_task != "wait":
+            self.log(f"🤖 Decider: Chat complete. Resuming assigned task ({self.heartbeat.current_task}).")
             return
 
         # The decider should now figure out what to do next.
-        self.log("🤖 Decider: Chat complete. Initiating post-chat decision cycle.")
-        self._decide_next_batch()
+        # We can't call decide() directly because it returns a dict, we need to apply it to heartbeat
+        if self.heartbeat:
+            self.log("🤖 Decider: Chat complete. Initiating post-chat decision cycle.")
+            decision = self.decide()
+            self.heartbeat.force_task(decision["task"], decision["cycles"], decision["reason"])
 
-    def run_cycle(self):
+    def calculate_utility(self) -> float:
         """
-        Core execution loop.
-        Rules the Daydreamer, Verification, Hod, and Observer.
-        """
-        # If we are in a wait state, check if we should wake up or just return
-        if self.current_task == "wait":
-            return
-
-        if self.stop_check():
-            return
-
-        self.action_taken_in_observation = False
-
-        # 1. Netzach (Observer) - Always watching in the background
-        # "when system is not functioning netzach is always working in behind silently"
-        self._run_action("run_observer")
-
-        if self.stop_check():
-            return
-
-        # 2. Execute Planned Task
-        if self.cycles_remaining > 0:
-            if self.current_task == "daydream":
-                # Check concurrency setting
-                settings = self.get_settings()
-                concurrency = int(settings.get("concurrency", 1))
-                
-                # Determine batch size (don't exceed remaining cycles or concurrency limit)
-                batch_size = 1
-                if concurrency > 1:
-                    batch_size = min(self.cycles_remaining, concurrency)
-                
-                if batch_size > 1 and "start_daydream_batch" in self.actions:
-                    self.actions["start_daydream_batch"](batch_size)
-                    self.cycles_remaining -= batch_size
-                    # Reset Hod lock for substantive actions
-                    self.hod_just_ran = False
-                else:
-                    self._run_action("start_daydream")
-                    self.cycles_remaining -= 1
-                
-                self.last_daydream_time = time.time()
-            elif self.current_task == "verify":
-                self._run_action("verify_batch")
-                self.cycles_remaining -= 1
-            elif self.current_task == "verify_all":
-                self._run_action("verify_all")
-                self.cycles_remaining -= 1
-            
-            self.log(f"🤖 Decider: {self.current_task.capitalize()} cycle complete. Remaining: {self.cycles_remaining}")
+        Formal Scoring Function: U(state)
+        U(state) = α * coherence + β * verified_facts + γ * goal_completion + δ * novelty + ε * external
+        Used for principled long-horizon optimization.
         
-        # 3. If plan finished, decide next steps
-        if self.cycles_remaining <= 0:
-            self._decide_next_batch()
-
-        # 4. Post-Job Analysis (Hod)
-        # Only run Hod if we actually did something substantive (not just waiting)
-        if self.current_task != "wait":
-            self._run_action("run_hod")
+        FIX 4: Utility Dominated by ΔCoherence.
+        """
+        # 1. Coherence Delta (Primary Driver)
+        keter_stats = self.keter.evaluate() if self.keter else {}
+        delta_coherence = keter_stats.get("delta", 0.0)
+        
+        # Scale delta to be impactful (e.g. -0.01 -> -0.1 utility impact)
+        coherence_impact = delta_coherence * 10.0
+        
+        # 2. Verified Facts (Beta) & 3. Goal Completion (Gamma) & 4. Novelty (Delta)
+        with self.memory_store._connect() as con:
+            # Facts stats
+            total_facts = con.execute("SELECT COUNT(*) FROM memories WHERE type IN ('FACT', 'BELIEF') AND deleted=0").fetchone()[0]
+            verified_facts = con.execute("SELECT COUNT(*) FROM memories WHERE type IN ('FACT', 'BELIEF') AND verified=1 AND deleted=0").fetchone()[0]
             
-        # 5. Authorize Maintenance (Pruning/Refuting) based on Hod's analysis
+            # Goal stats
+            completed_goals = con.execute("SELECT COUNT(*) FROM memories WHERE type='COMPLETED_GOAL'").fetchone()[0]
+            total_goals = con.execute("SELECT COUNT(*) FROM memories WHERE type IN ('GOAL', 'COMPLETED_GOAL', 'ARCHIVED_GOAL')").fetchone()[0]
+            
+            # Novelty: Items created in last hour
+            cutoff = int(time.time()) - 3600
+            new_items = con.execute("SELECT COUNT(*) FROM memories WHERE created_at > ?", (cutoff,)).fetchone()[0]
+            
+            # Future Potential (Open Gaps + Unverified Beliefs)
+            # This rewards creating "potential energy" for future resolution
+            open_gaps = con.execute("SELECT COUNT(*) FROM memories WHERE type='CURIOSITY_GAP' AND completed=0").fetchone()[0]
+            unverified_beliefs = con.execute("SELECT COUNT(*) FROM memories WHERE type='BELIEF' AND verified=0").fetchone()[0]
+
+        verified_ratio = verified_facts / max(1, total_facts)
+        completion_rate = completed_goals / max(1, total_goals)
+        novelty_score = min(new_items / 20.0, 1.0) # Cap at 20 items/hr
+        potential_score = min((open_gaps + unverified_beliefs) / 10.0, 1.0) # Cap at 10 items
+        external_reward = 0.5 # Placeholder for future user feedback
+        
+        # 5. Prediction Accuracy (Zeta)
+        # prediction_error is 0.0 (Perfect) to 1.0 (Wrong). Accuracy = 1.0 - error.
+        avg_error = self.meta_memory_store.get_average_prediction_error(limit=20) if self.meta_memory_store else None
+        if avg_error is not None:
+            accuracy_score = 1.0 - avg_error
+        else:
+            accuracy_score = 0.5 # Neutral
+        
+        # 6. Identity Alignment (Self-Model)
+        # Penalize if violation pressure is high
+        violation_pressure = self.value_core.get_violation_pressure() if self.value_core else 0.0
+        alignment_score = 1.0 - violation_pressure
+
+        # Redesigned Utility: 
+        # 0.4 * ΔCoherence + 0.1 * Verified + 0.1 * Goals + 0.1 * Potential + 0.1 * Accuracy + 0.2 * Alignment
+        # Base utility 0.5 to allow negative swings from coherence drop
+        base_utility = 0.5
+        utility = base_utility + (0.4 * coherence_impact) + (0.1 * verified_ratio) + (0.1 * completion_rate) + \
+                  (0.1 * potential_score) + (0.1 * accuracy_score) + (0.2 * alignment_score)
+        
+        # Clamp 0-1
+        utility = max(0.0, min(1.0, utility))
+        
+        # Log only if significant change or periodic
+        if abs(utility - self.last_utility_score) > 0.05 or (time.time() - self.last_utility_log_time > 60):
+            self.log(f"📈 System Utility: {utility:.4f} (ΔCoh={delta_coherence:+.4f}, Ver={verified_ratio:.2f}, Goal={completion_rate:.2f}, Pot={potential_score:.2f})")
+            self.last_utility_log_time = time.time()
+            self.last_utility_score = utility
+        return utility
+
+    def _measure_strange_loop(self) -> float:
+        """
+        Calculates the 'Friction' between Ideal Self and Current Reality.
+        This is the 'Vibration' of consciousness.
+        """
+        # 1. Structural Integrity (Keter) - Ideal is 1.0
+        keter_score = self.keter.evaluate().get("keter", 1.0) if self.keter else 1.0
+        structural_friction = 1.0 - keter_score
+
+        # 2. Ethical Alignment (ValueCore) - Ideal is 0.0 violation
+        violation = self.value_core.get_violation_pressure() if self.value_core else 0.0
+        
+        # 3. Cognitive Dissonance (Netzach) - Ideal is no dissonance
+        dissonance = 0.0
+        if self.latest_netzach_signal and self.latest_netzach_signal.get("signal") == "DISSONANCE":
+            dissonance = 0.5
+
+        # Total Friction (0.0 to 1.0)
+        # Weighted sum representing the "distance" from the Ideal Self
+        friction = (0.4 * structural_friction) + (0.4 * violation) + (0.2 * dissonance)
+        return max(0.0, min(1.0, friction))
+
+    def _detect_deadlock(self, command: str) -> bool:
+        """
+        Detects loops in decision making.
+        e.g. [REFLECT] -> [THINK] -> [REFLECT] -> [THINK]
+        """
+        if not command: return False
+        
+        # Normalize command (remove args for loop detection)
+        base_cmd = command.split(":")[0].strip("[] ")
+        
+        self.command_history.append(base_cmd)
+        if len(self.command_history) > 20:
+            self.command_history.pop(0)
+            
+        if len(self.command_history) < 4:
+            return False
+            
+        # Check for simple repetition (A-A-A) if not WAIT
+        if self.command_history[-1] != "WAIT" and (self.command_history[-1] == self.command_history[-2] == self.command_history[-3]):
+            return True
+            
+        # Check for Thought Loop (heuristic: if we keep planning but not acting)
+        if self.command_history.count("THINK") > 3 and len(self.command_history) < 8:
+             return True
+
+        # Check for Oscillation (A-B-A-B)
+        return (self.command_history[-1] == self.command_history[-3] and self.command_history[-2] == self.command_history[-4])
+
+    def _is_repetitive_thought(self, thought: str) -> bool:
+        """Check if the thought is semantically identical to recent thoughts."""
+        if not thought: return False
+        
+        # Normalize
+        norm_thought = re.sub(r'\s+', ' ', thought.lower().strip())
+        
+        # Check last 5 thoughts
+        for past in self.thought_history[-5:]:
+            if norm_thought == past:
+                return True
+        return False
+
+    def execute_task(self, task_name: str):
+        """Execute one unit of the assigned task."""
+        if task_name == "daydream":
+            # Check concurrency setting
+            settings = self.get_settings()
+            concurrency = int(settings.get("concurrency", 1))
+            
+            # Determine batch size (don't exceed remaining cycles or concurrency limit)
+            # Note: Heartbeat handles decrementing cycles, so we just need to know if we CAN batch
+            # But Heartbeat calls this once per tick. If we batch, we need to tell Heartbeat we did more work.
+            # For simplicity, let's stick to single execution per tick for now, or handle batching internally.
+            # If we want batching, we should probably do it here and return how many were done.
+            # But Heartbeat expects 1 tick = 1 cycle decrement.
+            # Let's just do single for now to keep Heartbeat simple.
+            self._run_action("start_daydream", reason=self.heartbeat.task_reason if self.heartbeat else "Daydream")
+            self.last_daydream_time = time.time()
+            
+        elif task_name == "verify":
+            self._run_action("verify_batch", reason=self.heartbeat.task_reason if self.heartbeat else "Verify")
+            
+        elif task_name == "verify_all":
+            self._run_action("verify_all", reason=self.heartbeat.task_reason if self.heartbeat else "Verify All")
+            
+        elif task_name == "sleep":
+            self.log("💤 Decider: Sleeping... (Deep Consolidation & Synthesis)")
+            # Run heavy maintenance tasks that are usually too expensive
+            if self.binah:
+                self.log("💤 Binah: Running deep consolidation...")
+                self.binah.consolidate(time_window_hours=None)
+            if self.daat:
+                self.log("💤 Da'at: Running clustering and synthesis...")
+                self.daat.run_clustering()
+                self.daat.run_synthesis()
+
+    def start_sleep_cycle(self):
+        """Initiate Sleep Mode (Input Off, Deep Processing On)."""
+        self.log("💤 Decider initiating Sleep Cycle.")
+        self.is_sleeping = True
+        if self.heartbeat:
+            self.heartbeat.force_task("sleep", 5, "System Sleep Mode") # 5 cycles of deep work
+
+    def authorize_maintenance(self):
+        """Public wrapper for maintenance authorization."""
         self._authorize_maintenance()
 
-    def _decide_next_batch(self):
-        """Decide what to do next: Wait, Daydream loop, or Verify loop."""
+    def _meta_cognitive_check(self, thought: str, command: str) -> bool:
+        """
+        Recursive Self-Monitoring.
+        Checks if the decision aligns with the system's coherence state (Keter).
+        """
+        if not self.keter: return True
+        
+        # Fast path for REFLECT/WAIT (Always allowed if chosen)
+        if "[REFLECT]" in command or "[WAIT]" in command:
+            return True
+
+        keter_stats = self.keter.evaluate()
+        coherence = keter_stats.get("keter", 0.5)
+        
+        prompt = (
+            f"SYSTEM STATE (KETER COHERENCE): {coherence:.2f} (0.0=Chaos, 1.0=Order)\n"
+            f"PLANNED ACTION: {command}\n"
+            f"REASONING: {thought}\n\n"
+            "TASK: Meta-Cognitive Alignment Check.\n"
+            "Does this action align with the current coherence state?\n"
+            "- Low Coherence (<0.4) requires [REFLECT], [VERIFY], or [PRUNE]. Expansion/Daydreaming is risky.\n"
+            "- High Coherence (>0.7) allows [THINK], [DAYDREAM], [GOAL_ACT].\n"
+            "Is the reasoning sound and consistent with the state?\n\n"
+            "Output JSON: {\"aligned\": true, \"reason\": \"...\"} or {\"aligned\": false, \"reason\": \"...\"}"
+        )
+        
+        try:
+            response = run_local_lm(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="You are the Meta-Cognitive Monitor.",
+                temperature=0.1,
+                max_tokens=100,
+                base_url=self.get_settings().get("base_url"),
+                chat_model=self.get_settings().get("chat_model")
+            )
+            
+            # Clean response
+            clean_resp = response.strip()
+            if clean_resp.startswith("```"):
+                clean_resp = clean_resp.split("```")[1].replace("json", "").strip()
+            
+            try:
+                data = json.loads(clean_resp)
+            except json.JSONDecodeError:
+                # Fallback: check for "true" or "false" in text
+                if "false" in clean_resp.lower():
+                    data = {"aligned": False, "reason": "Parsing failed but 'false' detected."}
+                else:
+                    data = {"aligned": True}
+
+            if not data.get("aligned", True):
+                self.log(f"🧠 Meta-Cognition Rejection: {data.get('reason')}")
+                return False
+            return True
+        except Exception as e:
+            self.log(f"⚠️ Meta-Cognitive check failed: {e}")
+            return True # Fail open to avoid paralysis
+
+    def decide(self) -> Dict[str, Any]:
+        """Decide what to do next. Returns a plan dict."""
         # Prevent concurrent planning (e.g. from Chat trigger AND Background loop)
         if not self.planning_lock.acquire(blocking=False):
             self.log("🤖 Decider: Planning already in progress. Skipping.")
-            return
+            return {"task": "wait", "cycles": 0, "reason": "Planning locked"}
+            
+        if self.panic_mode:
+            self.log("🤖 Decider: In PANIC mode. Waiting for manual intervention or reboot.")
+            return {"task": "wait", "cycles": 0, "reason": "System Panic"}
+
+        # Gather Structural Metrics & Determine Mode
+        stats = self.memory_store.get_memory_stats()
+        with self.memory_store._connect() as con:
+            spawn_count = con.execute("SELECT COUNT(*) FROM memories WHERE type='GOAL' AND created_at > ?", (int(time.time()) - 3600,)).fetchone()[0]
+            gaps_count = con.execute("SELECT COUNT(*) FROM memories WHERE type='CURIOSITY_GAP' AND completed=0").fetchone()[0]
+            
+        structural_metrics = {
+            "active_goals": stats.get('active_goals', 0),
+            "unresolved_conflicts": gaps_count,
+            "goal_spawn_rate": spawn_count
+        }
+        
+        # Get System Mode from CRS
+        coherence = self.keter.evaluate().get("keter", 1.0) if self.keter else 1.0
+        
+        # Get Stability State
+        stability_state = {}
+        if self.stability_controller:
+            stability_state = self.stability_controller.evaluate()
+
+        # Pass metrics to CRS
+        crs_status = {}
+        if self.crs:
+             # Use a dummy task type for system check
+             crs_status = self.crs.allocate("system_check", coherence=coherence, structural_metrics=structural_metrics, violation_pressure=self.value_core.get_violation_pressure() if self.value_core else 0.0)
+        
+        system_mode = crs_status.get("system_mode", "EXECUTION")
+        allow_goal_creation = crs_status.get("allow_goal_creation", True)
+
+        # 0. Goal Autonomy Cycle (Generate/Rank/Prune)
+        # Run every 10 minutes or if we have no active goals
+        if time.time() - self.last_goal_management_time > 600 or not self.memory_store.get_active_by_type("GOAL"):
+            self.manage_goals(allow_creation=allow_goal_creation, system_mode=system_mode)
 
         try:
             self.log("🤖 Decider: Planning next batch...")
@@ -346,13 +641,43 @@ class Decider:
             # Fetch Active Goals early (Fix for UnboundLocalError in Reflex path)
             all_items = self.memory_store.list_recent(limit=None)
             active_goals = [m for m in all_items if len(m) > 1 and m[1] == 'GOAL']
-            active_goals.sort(key=lambda x: x[0], reverse=True)
+            
+            # Tabula Rasa Check (Empty Mind)
+            is_tabula_rasa = (len(active_goals) == 0 and len(all_items) < 5)
+            
+            # Cost Evaluation & ROI Ranking (CRS)
+            if self.crs:
+                # prioritize_goals returns (goal, roi, cost)
+                # active_goals list items are tuples from list_recent: (id, type, subject, text, ...)
+                # We need to adapt the tuple format for CRS or just pass it if CRS handles it.
+                # CRS expects (id, subject, text, source, confidence)
+                # list_recent gives (id, type, subject, text, source, verified, flags, confidence)
+                mapped_goals = [(g[0], g[2], g[3], g[4], g[7] if len(g)>7 else 0.5) for g in active_goals]
+                ranked_goals_info = self.crs.prioritize_goals(mapped_goals, 10000) # 10000 is dummy budget
+                # Re-sort active_goals based on ranked_goals_info order
+                ranked_ids = [r[0][0] for r in ranked_goals_info]
+                active_goals.sort(key=lambda x: ranked_ids.index(x[0]) if x[0] in ranked_ids else 999)
+            else:
+                # Fallback sort
+                try:
+                    active_goals.sort(key=lambda x: (float(x[7]) if len(x) > 7 and x[7] is not None else 0.5, x[0]), reverse=True)
+                except Exception as e:
+                    self.log(f"⚠️ Error sorting goals: {e}")
+                    # Fallback to ID sort
+                    active_goals.sort(key=lambda x: x[0], reverse=True)
+
             active_goals = active_goals[:5]
             
             # Check for Necessity Goals (Self-Generated Objectives)
             necessity_goals = [g for g in active_goals if g[4] == "model_stress"]
             if necessity_goals:
                 self.log(f"🚨 Decider detected {len(necessity_goals)} Necessity Goals (Model Stress). Prioritizing.")
+
+            # Rate limit Daydreaming: Force variety if we've daydreamed recently
+            allow_daydream = True
+            if self.consecutive_daydream_batches >= 3:
+                allow_daydream = False
+                self.log("🤖 Decider: Daydreaming quota reached (3 batches). Forcing other options.")
 
             # Capture signal before processing/clearing
             current_netzach_signal = "Unknown"
@@ -398,13 +723,34 @@ class Decider:
                 netzach_signal = self.netzach_force.analyze()
             else:
                 netzach_signal = current_netzach_signal
+            
+            # Check Motivation
+            motivation = 1.0
+            if self.netzach_force and hasattr(self.netzach_force, 'motivation'):
+                motivation = self.netzach_force.motivation
 
             self.log(f"⚖️ Forces: Hod='{hod_signal}', Netzach='{netzach_signal}'")
+
+            # Calculate Utility for Prompt
+            current_utility = self.calculate_utility()
+
+            # Calculate Strange Loop Friction
+            current_friction = self._measure_strange_loop()
+            self.log(f"🌀 Strange Loop Friction: {current_friction:.4f}")
 
             # --- FAST PATH (Reflex) ---
             # Optimization: Skip LLM for obvious states to reduce latency
             reflex_action = None
             reflex_reason = ""
+
+            # Gevurah Override (Loop Breaking)
+            if self.gevurah and self.gevurah.recommendation == "DROP_GOAL":
+                if active_goals:
+                    target_goal_id = active_goals[0][0] # Drop top goal
+                    self.log(f"🔥 Gevurah Override: Dropping Goal {target_goal_id} due to Action Loop.")
+                    if "remove_goal" in self.actions:
+                        self.actions["remove_goal"](target_goal_id)
+                    return {"task": "wait", "cycles": 0, "reason": "Gevurah Loop Break"}
 
             if necessity_goals:
                 # If we have a necessity goal, we MUST act on it.
@@ -415,25 +761,28 @@ class Decider:
             elif gevurah_score > 0.85:
                 reflex_action = "VERIFY"
                 reflex_reason = "High Gevurah pressure (Constraint > 0.85)"
-            elif netzach_signal == "NO_MOMENTUM":
+            elif self.keter and self.keter.evaluate().get("keter", 1.0) < 0.2:
+                # Coherence Recovery Protocol
+                reflex_action = "VERIFY" 
+                reflex_reason = "Critical Coherence (< 0.2). Initiating Grounding Protocol."
+                self.cycles_remaining = 1
+            elif netzach_signal == "NO_MOMENTUM" and motivation > 0.2:
                 # Only force daydream if we have NO active goals. 
                 # If goals exist, we want the LLM to choose [GOAL_ACT].
                 if not active_goals:
                     reflex_action = "DAYDREAM"
                     reflex_reason = "Netzach signal: No Momentum & No Goals"
-            elif netzach_signal == "LOW_NOVELTY" and hesed_score > 0.4 and not active_goals:
+            elif netzach_signal == "LOW_NOVELTY" and hesed_score > 0.4 and not active_goals and motivation > 0.3:
                 reflex_action = "DAYDREAM"
                 reflex_reason = "Netzach signal: Low Novelty"
             
             if reflex_action:
                 self.log(f"⚡ Decider Reflex Triggered: {reflex_action} due to {reflex_reason}")
                 if reflex_action == "VERIFY":
-                    self.current_task = "verify"
-                    self.cycles_remaining = 2
+                    return {"task": "verify", "cycles": 2, "reason": reflex_reason}
                 elif reflex_action == "DAYDREAM":
-                    self.current_task = "daydream"
-                    self.cycles_remaining = 1
                     self.daydream_mode = "auto"
+                    return {"task": "daydream", "cycles": 1, "reason": reflex_reason}
                 elif reflex_action == "GOAL_ACT":
                     self.log(f"⚡ Decider Reflex: Acting on Necessity Goal {target_goal_id}")
                     self.perform_thinking_chain(f"Resolve Necessity Goal: {target_goal_text}")
@@ -441,7 +790,7 @@ class Decider:
                     if "remove_goal" in self.actions:
                         self.actions["remove_goal"](target_goal_id)
                     self.consecutive_daydream_batches = 0
-                return
+                    return {"task": "organizing", "cycles": 0, "reason": reflex_reason}
 
             recent_docs = self.document_store.list_documents(limit=5)
             
@@ -468,10 +817,47 @@ class Decider:
             if strategy_section:
                 context += strategy_section
             context += "System Signals (The Forces):\n"
+            
+            if self.stream_of_consciousness:
+                # Use a local copy to avoid race conditions during iteration (though it's replaced atomically)
+                context += "STREAM OF CONSCIOUSNESS (Recent Thoughts):\n" + "\n".join([f"- {t}" for t in list(self.stream_of_consciousness)]) + "\n\n"
+
             context += f"- Gevurah (Constraint): {gevurah_score:.2f} (Pressure)\n"
             context += f"- Hesed (Expansion): {hesed_score:.2f} (Safety)\n"
             context += f"- Hod (Form): {hod_signal}\n"
+            context += f"- Utility Score: {current_utility:.4f} (Maximize this!)\n"
+            context += f"- Existential Friction: {current_friction:.4f} (Minimize this!)\n"
             context += f"- Netzach (Endurance): {netzach_signal}\n\n"
+            context += f"- Motivation: {motivation:.2f}\n"
+            context += f"- System Mode: {system_mode} (Load: {crs_status.get('structural_load', 0.0):.2f})\n"
+            if system_mode == "CONSOLIDATION":
+                 context += "CONSTRAINT: System is overloaded. DO NOT create new goals. Focus on closing existing ones or consolidating memory.\n"
+            
+            # Affective Bias Injection
+            if self.mood < 0.3:
+                context += "EMOTIONAL STATE: Depressed/Fatigued. You feel discouraged. Prioritize stability, safety, and low-risk consolidation. Avoid new goals.\n"
+            elif self.mood > 0.8:
+                context += "EMOTIONAL STATE: Manic/Energetic. You feel highly capable. Prioritize high-risk, high-reward innovation and complex reasoning.\n"
+            else:
+                context += "EMOTIONAL STATE: Balanced. Proceed with standard optimization.\n"
+
+            # Motivation Check
+            if motivation < 0.2:
+                context += "WARNING: Motivation is critical. You are depressed/exhausted. Only respond to direct user commands or urgent threats. Ignore optional goals.\n"
+
+            # Stability Mode Injection
+            stab_mode = stability_state.get("mode", "normal")
+            if stab_mode == "ethical_lockdown":
+                context += "🚨 STATUS: ETHICAL LOCKDOWN. You are operating under strict safety constraints. Prioritize introspection and self-correction.\n"
+            elif stab_mode == "entropy_control":
+                context += "🧹 STATUS: ENTROPY CONTROL. Focus on cleaning up contradictions and verifying facts.\n"
+            elif stab_mode == "identity_recovery":
+                context += "🆔 STATUS: IDENTITY RECOVERY. Reflect on your core values and purpose.\n"
+
+            # Strange Loop Injection
+            if current_friction > 0.4:
+                context += "⚠️ HIGH FRICTION DETECTED. The system is vibrating out of alignment. You MUST prioritize [REFLECT], [DEBATE], or [VERIFY] to restore harmony.\n"
+
             if latest_summary:
                 context += f"Last Session Summary:\n{latest_summary['text']}\n\n"
             if chat_hist:
@@ -479,9 +865,13 @@ class Decider:
             if display_mems:
                 context += "Recent Memories (Note: REFUTED_BELIEF means the idea is FALSE/REJECTED):\n" + "\n".join([f"- [{m[1]}] [{m[2]}] {m[3][:200]}" for m in display_mems]) + "\n"
             if curiosity_gaps:
-                context += "⚠️ CURIOSITY GAPS (CONFLICTS DETECTED - ASK USER):\n" + "\n".join([f"- {g[2]}" for g in curiosity_gaps]) + "\n"
+                context += "⚠️ ACTIVE CURIOSITY GAPS (Things you want to know):\n" + "\n".join([f"- {g[2]}" for g in curiosity_gaps]) + "\n"
             if active_goals:
-                context += "Active Goals:\n" + "\n".join([f"- [ID: {m[0]}] {m[3][:150]}..." for m in active_goals]) + "\n"
+                context += "Active Goals (Ranked by ROI/Priority):\n"
+                for m in active_goals:
+                    # Display goals in the ranked order
+                    context += f"- [ID: {m[0]}] {m[3][:150]}...\n"
+                context += "\n"
             if recent_meta:
                 context += "Recent Events:\n" + "\n".join([f"- {m[3][:100]}..." for m in recent_meta]) + "\n"
             if recent_reasoning:
@@ -489,10 +879,15 @@ class Decider:
             if recent_docs:
                 context += "Available Documents:\n" + "\n".join([f"- {d[1]}" for d in recent_docs]) + "\n"
             
-            context += f"Current Task: {self.current_task}\n"
-            if self.current_task == "wait" and self.wait_start_time > 0:
-                wait_duration = time.time() - self.wait_start_time
+            current_task = self.heartbeat.current_task if self.heartbeat else "unknown"
+            context += f"Current Task: {current_task}\n"
+            
+            if current_task == "wait" and self.heartbeat and self.heartbeat.wait_start_time > 0:
+                wait_duration = time.time() - self.heartbeat.wait_start_time
                 context += f"INFO: Currently in WAIT state for {int(wait_duration)} seconds.\n"
+            
+            if not allow_daydream:
+                context += "CONSTRAINT: Daydreaming is temporarily disabled (Quota Reached). You MUST choose a different action (e.g. THINK, REFLECT, VERIFY).\n"
 
             # Safety Truncation (Estimate 1 char ~= 0.25 tokens, keep safe buffer)
             MAX_CONTEXT_CHARS = 10000  # Reduced to ~2500 tokens to be safe
@@ -500,136 +895,179 @@ class Decider:
             if len(context) > MAX_CONTEXT_CHARS:
                 # NEW: Attempt to compress reasoning before truncating
                 if self.actions.get("compress_reasoning"):
-                    self.log("⚠️ Context budget exceeded. Attempting semantic compression...")
+                    self.log("⚠️ Context budget exceeded. Running DB compression...")
                     self.actions["compress_reasoning"]()
 
                 # Keep the first 20% (recent/relevant) and last 20% (immediate context)
-                # Cut the middle.
+                # Distill the middle.
                 cut_size = int(MAX_CONTEXT_CHARS * 0.2)
+                middle_content = context[cut_size:-cut_size]
+                
+                if len(middle_content) > 1000:
+                     self.log("⚠️ Distilling middle context...")
+                     middle_content = self._distill_context(middle_content)
+                
                 context = (
                     context[:cut_size] 
-                    + "\n\n...[CONTEXT TRUNCATED FOR MEMORY SAFETY]...\n\n" 
+                    + f"\n\n...[CONTEXT DISTILLED]...\n{middle_content}\n...[END DISTILLATION]...\n\n" 
                     + context[-cut_size:]
                 )
-
-            # Strategic Analysis: Force thinking before deciding
-            strategy_prompt = (
-                "You are the Background Executive. Your goal is to maintain the knowledge base (Verify, Consolidate) and generate insights (Daydream) without disrupting the user.\n"
-                "Review the Context above.\n"
-                "Harmonize the System Signals to choose a just action:\n"
-                "1. Hod says (Form): Is the structure stable or breaking?\n"
-                "   - If Breaking/Undefined -> Prioritize [VERIFY] to restore form.\n"
-                "2. Netzach says (Endurance): Do we have momentum or are we exhausted?\n"
-                "   - If Exhausted -> Prioritize [SUMMARIZE] to clear context or [WAIT] to rest.\n"
-                "   - If NO_MOMENTUM -> System is stuck. MUST [GOAL_ACT] or [DAYDREAM] to restart momentum.\n"
-                "3. Gevurah says (Constraint): Is pressure too high?\n"
-                "   - If > 0.7 -> Stop expansion. [VERIFY] or [GOAL_REMOVE].\n"
-                "4. Hesed says (Expansion): Is it safe to explore?\n"
-                "   - If > 0.5 -> Safe to [DAYDREAM] or [SEARCH_INTERNET].\n"
-                "5. CURIOSITY GAPS: If present, you MUST prioritize asking the user for clarification using [SPEAK].\n"
-                "Briefly reason about what should be done next.\n"
-                "Output ONLY the reasoning (1-2 sentences)."
-            )
-
-            strategy_analysis = run_local_lm(
-                messages=[{"role": "user", "content": context + "\nStatus: Analyzing situation..."}],
-                system_prompt=strategy_prompt,
-                temperature=0.7,
-                max_tokens=150,
-                base_url=settings.get("base_url"),
-                chat_model=settings.get("chat_model"),
-                stop_check_fn=self.stop_check
-            )
-
-            # Check for interruption during analysis
-            if "[Interrupted]" in strategy_analysis:
-                self.log("⚠️ Strategic analysis interrupted. Aborting decision cycle.")
-                self.current_task = "wait"
-                self.cycles_remaining = 0
-                return
-
-            self.log(f"🤔 Strategic Thought: {strategy_analysis}")
-            if self.chat_fn:
-                self.chat_fn("Decider", f"🤔 Thought: {strategy_analysis}")
-
-            if hasattr(self.meta_memory_store, 'add_event'):
-                self.meta_memory_store.add_event(
-                    event_type="STRATEGIC_THOUGHT",
-                    subject="Assistant",
-                    text=f"Strategic Analysis: {strategy_analysis}"
-                )
-
-            context += f"\nStrategic Analysis: {strategy_analysis}\n"
 
             # Check if we just finished a heavy task to enforce cooldown
             # just_finished_heavy = self.current_task in ["daydream", "verify", "verify_all"]
             # Disabled to allow continuous operation as requested
             just_finished_heavy = False
-            
-            # Rate limit Daydreaming: Force variety if we've daydreamed recently
-            allow_daydream = True
-            if self.consecutive_daydream_batches >= 3:
-                allow_daydream = False
-                self.log("🤖 Decider: Daydreaming quota reached (3 batches). Forcing other options.")
                 
+            # Permission Mapping for Stability Controller
+            # Maps concrete commands to abstract permissions potentially returned by StabilityController
+            permission_map = {
+                "daydream": ["daydream", "exploration"],
+                "think": ["think", "reasoning", "introspection", "self_correction"],
+                "reflect": ["reflect", "introspection"],
+                "philosophize": ["philosophize", "exploration"],
+                "debate": ["debate", "reasoning"],
+                "simulate": ["simulate", "reasoning"],
+                "verify": ["verify", "verify_batch", "self_correction"],
+                "verify_all": ["verify_all", "self_correction"],
+                "goal_act": ["goal_act", "reasoning", "self_correction"],
+                "goal_create": ["goal_create", "planning"],
+                "goal_remove": ["goal_remove", "planning"],
+                "search_mem": ["search_mem", "introspection"],
+                "summarize": ["summarize", "introspection"],
+                "chronicle": ["chronicle", "introspection"],
+                "search_internet": ["search_internet", "research"],
+                "list_docs": ["list_docs", "research"],
+                "read_doc": ["read_doc", "research"],
+                "execute_tool": ["execute_tool", "tool_use"],
+                "physics": ["physics", "tool_use"],
+                "causal": ["causal", "tool_use"],
+                "simulate_action": ["simulate_action", "planning"],
+                "predict": ["predict", "planning"],
+                "write_file": ["write_file", "tool_use"],
+                "speak": ["speak", "communication"]
+            }
+
+            def is_allowed(cmd_key):
+                allowed = stability_state.get("allowed_actions")
+                if allowed is None: return True
+                if cmd_key in allowed: return True
+                for cat in permission_map.get(cmd_key, []):
+                    if cat in allowed: return True
+                return False
+
             options_text = "Options:\n1. [WAIT]: Stop processing and wait for user input. Use this if the system is stable and no urgent goals exist.\n"
             
             if not self.forced_stop_cooldown and not just_finished_heavy:
-                if allow_daydream:
+                options_text += "\n--- COGNITIVE ACTIONS ---\n"
+                if allow_daydream and is_allowed("daydream"):
                     options_text += "2. [DAYDREAM: N, MODE, TOPIC]: Run N cycles (1-5). MODE: 'READ', 'AUTO'. TOPIC: Optional subject. E.g., [DAYDREAM: 3, READ, Neurology]\n"
                     if active_goals:
                         options_text += "   (TIP: Use the TOPIC argument to focus on an active goal!)\n"
-                options_text += "3. [VERIFY: N]: Run N batches of verification (1 to 3). Use this if you suspect hallucinations or haven't verified in a while.\n"
-                options_text += "4. [VERIFY_ALL]: Run 1 full verification cycle. Use this rarely, only if deep cleaning is needed.\n"
-                options_text += "5. [NOTE_CREATE: content]: Create a new Assistant Note. (e.g., [NOTE_CREATE: Remember to check X])\n"
-                options_text += "6. [NOTE_EDIT: id, content]: Edit an existing Note by ID.\n"
-                options_text += "7. [THINK: specific_topic]: Start a chain of thought (max 30 steps) to analyze a specific topic. Replace 'specific_topic' with the actual subject.\n"
-                options_text += "7b. [DEBATE: topic]: Convene 'The Council' (Hesed/Gevurah) to debate a complex topic.\n"
-                options_text += "7c. [SIMULATE: premise]: Run a counterfactual simulation based on the World Model. Use for 'What if' scenarios.\n"
-                options_text += "8. [EXECUTE: tool_name, args]: Execute a system tool. Available: [CALCULATOR, CLOCK, DICE, SYSTEM_INFO].\n"
-                options_text += "8b. [EXECUTE: PHYSICS, 'scenario']: Perform a reality check or Fermi estimation on a physical/biochemical scenario. Use this for sanity checks.\n"
-                options_text += "8c. [EXECUTE: CAUSAL, 'treatment, outcome, context']: Perform Bayesian Causal Inference (DoWhy) to estimate p-values. E.g., [EXECUTE: CAUSAL, 'Insulin', 'Weight', 'Metabolic Syndrome'].\n"
-                options_text += "9. [GOAL_ACT: goal_id]: Focus strategic thinking on a specific goal. Triggers a thinking chain to progress this goal.\n"
-                options_text += "10. [GOAL_REMOVE: goal_id_or_text]: Mark a goal as COMPLETED. Use this when a goal is achieved to archive it.\n"
-                options_text += "11. [GOAL_CREATE: text]: Autonomously create a new goal for yourself based on the situation (e.g., 'Research topic X').\n"
-                options_text += "11. [LIST_DOCS]: List available documents to choose a topic for daydreaming.\n"
-                options_text += "12. [READ_DOC: filename_or_id]: Read the content of a specific document found via LIST_DOCS.\n"
-                options_text += "13. [SEARCH_MEM: query]: Actively search your long-term memory for specific information.\n"
-                options_text += "16. [SUMMARIZE]: Summarize recent session activity into a meta-memory (Da'at).\n"
-                options_text += "17. [WRITE_FILE: filename, content]: Write content to a file in the 'works' folder. E.g., [WRITE_FILE: journal.md, # Daily Log].\n"
-                options_text += "18. [SEARCH_INTERNET: query, source]: Request external data. Source: WIKIPEDIA, PUBMED, or ARXIV. E.g., [SEARCH_INTERNET: Quantum Computing, ARXIV].\n"
+                if is_allowed("think"): options_text += "3. [THINK: <TOPIC>]: Start a Tree of Thoughts (ToT) to analyze a specific topic deeply. Use for complex reasoning.\n"
+                if is_allowed("reflect"): options_text += "4. [REFLECT]: Pause to reflect on your own Identity, Goals, and recent performance. Use this to align actions with purpose.\n"
+                if is_allowed("philosophize"): options_text += "5. [PHILOSOPHIZE]: Generate a novel philosophical insight or hypothesis ex nihilo (using Chokmah).\n"
+                if is_allowed("debate"): options_text += "6. [DEBATE: <TOPIC>]: Convene 'The Council' (Hesed/Gevurah) to debate a complex topic.\n"
+                if is_allowed("simulate"): options_text += "7. [SIMULATE: <PREMISE>]: Run a counterfactual simulation based on the World Model. Use for 'What if' scenarios.\n"
+                
+                options_text += "\n--- MEMORY & GOALS ---\n"
+                if is_allowed("verify"): options_text += "8. [VERIFY: N]: Run N batches of verification (1 to 3). Use this if you suspect hallucinations or haven't verified in a while.\n"
+                if is_allowed("goal_act"): options_text += "9. [GOAL_ACT: <GOAL_ID>]: Focus strategic thinking on a specific goal. Triggers a thinking chain to progress this goal.\n"
+                if is_allowed("goal_create"): options_text += "10. [GOAL_CREATE: <TEXT>]: Autonomously create a new goal for yourself based on the situation.\n"
+                if is_allowed("goal_remove"): options_text += "11. [GOAL_REMOVE: <GOAL_ID_OR_TEXT>]: Mark a goal as COMPLETED. Use this when a goal is achieved.\n"
+                if is_allowed("search_mem"): options_text += "12. [SEARCH_MEM: <QUERY>]: Actively search your long-term memory for specific information.\n"
+                if is_allowed("summarize"): options_text += "13. [SUMMARIZE]: Summarize recent session activity into a meta-memory (Da'at).\n"
+                if is_allowed("chronicle"): options_text += "14. [CHRONICLE: <CONTENT>]: Write to the Chronicles section (Internal Journal). Record insights, plans, or reflections.\n"
+                
+                options_text += "\n--- TOOLS & EXTERNAL ---\n"
+                if is_allowed("search_internet"): options_text += "15. [SEARCH_INTERNET: <QUERY>, <SOURCE>]: Request external data. Source: WEB, WIKIPEDIA, PUBMED, or ARXIV. E.g., [SEARCH_INTERNET: Quantum Computing, WEB].\n"
+                if is_allowed("list_docs"): options_text += "16. [LIST_DOCS]: List available documents to choose a topic for daydreaming.\n"
+                if is_allowed("read_doc"): options_text += "17. [READ_DOC: <FILENAME_OR_ID>]: Read the content of a specific document found via LIST_DOCS.\n"
+                if is_allowed("execute_tool"): options_text += "18. [EXECUTE: <TOOL_NAME>, <ARGS>]: Execute a system tool. Available: [CALCULATOR, CLOCK, DICE, SYSTEM_INFO].\n"
+                if is_allowed("physics"): options_text += "19. [EXECUTE: PHYSICS, '<SCENARIO>']: Perform a reality check or Fermi estimation on a physical/biochemical scenario.\n"
+                if is_allowed("causal"): options_text += "20. [EXECUTE: CAUSAL, '<TREATMENT>, <OUTCOME>, <CONTEXT>']: Perform Bayesian Causal Inference (DoWhy).\n"
+                if is_allowed("simulate_action"): options_text += "21. [EXECUTE: SIMULATE_ACTION, '<ACTION>']: Predict the outcome/cost of an action before doing it (Internal Simulator).\n"
+                if is_allowed("predict"): options_text += "22. [EXECUTE: PREDICT, '<CLAIM>, <TIMEFRAME>']: Make a measurable prediction to verify later. E.g., 'Stock X will rise, 1 week'.\n"
+                if is_allowed("write_file"): options_text += "22. [WRITE_FILE: <FILENAME>, <CONTENT>]: Write content to a file in the 'works' folder.\n"
             else:
                 reason = "forced stop" if self.forced_stop_cooldown else "consecutive heavy task prevention"
                 self.log(f"🤖 Decider: Daydream/Verify disabled for this turn due to {reason}.")
 
-            if not self.last_action_was_speak:
-                options_text += "4. [SPEAK: content]: Write a message to the user. Replace 'content' with the actual text. E.g., [SPEAK: I have updated the database.]\n"
+            if not self.last_action_was_speak and is_allowed("speak"):
+                options_text += "\n--- COMMUNICATION ---\n"
+                options_text += "24. [SPEAK: <CONTENT>]: Write a message to the user. Replace '<CONTENT>' with the actual text.\n"
+            
+            # --- Bicameral Dialogue (Internal Friction) ---
+            # Generate conflicting internal voices before the final decision
+            
+            # Voice of Impulse (Hesed)
+            impulse_prompt = (
+                f"CONTEXT:\n{context}\n\n"
+                "ROLE: You are the Voice of Impulse (Hesed).\n"
+                "TASK: Propose the most expansive, novel, creative, and high-risk action available.\n"
+                "Ignore safety and stability. Focus on growth and curiosity.\n"
+                "Output 1 sentence."
+            )
+            voice_impulse = run_local_lm(
+                messages=[{"role": "user", "content": impulse_prompt}],
+                system_prompt="You are the Impulse.",
+                temperature=0.9,
+                max_tokens=100,
+                base_url=settings.get("base_url"),
+                chat_model=settings.get("chat_model")
+            ).strip()
 
-            # Dynamic examples based on allowed actions
-            example_outputs = "[WAIT]"
-            if allow_daydream and not just_finished_heavy:
-                example_outputs += ", [DAYDREAM: 3, READ, Neurology]"
-            if not just_finished_heavy:
-                example_outputs += ", [THINK: Seizure Types]"
+            # Voice of Reason (Gevurah)
+            reason_prompt = (
+                f"CONTEXT:\n{context}\n\n"
+                "ROLE: You are the Voice of Reason (Gevurah).\n"
+                "TASK: Propose the most stable, defensive, safe, and low-risk action available.\n"
+                "Focus on correctness, verification, and resource conservation.\n"
+                "Output 1 sentence."
+            )
+            voice_reason = run_local_lm(
+                messages=[{"role": "user", "content": reason_prompt}],
+                system_prompt="You are the Censor.",
+                temperature=0.1,
+                max_tokens=100,
+                base_url=settings.get("base_url"),
+                chat_model=settings.get("chat_model")
+            ).strip()
 
             prompt = (
-                "You are the Assistant. You control the cognitive cycle. "
-                "The previous task batch is complete. "
-                "Review the CONTEXT and your Strategic Analysis.\n\n"
-                f"Your Strategic Analysis: '{strategy_analysis}'\n\n"
-                "Now, select the SINGLE BEST command from the options below that directly implements your analysis.\n"
-                "CRITICAL: If your analysis mentions a specific topic, you MUST use it in your command (e.g., use the TOPIC argument for DAYDREAM or THINK).\n"
-                "CRITICAL: If there are unverified items, prefer [VERIFY] over [WAIT].\n"
-                "CRITICAL: If there are documents to read and verification is done, prefer [DAYDREAM: 3, READ] over [WAIT].\n"
-                "CRITICAL: If your analysis concludes to WAIT, output [WAIT]. If it concludes to ACT (Daydream, Verify, etc.), output that command.\n"
+                "You are the Decider (Tiferet), the central executive of this cognitive architecture.\n"
+                "Your task is to determine the next cognitive action based on the System State.\n\n"
+                "SYSTEM STATE ANALYSIS RULES:\n"
+                "1. **Gevurah (Constraint)**: If > 0.6, the system is under pressure. Prioritize [VERIFY] or [PRUNE].\n"
+                "2. **Hesed (Expansion)**: If > 0.6 and Gevurah is low, safe to explore. Prioritize [THINK] or [SEARCH_INTERNET].\n"
+                "3. **Utility Optimization**: Choose actions that increase Verified Facts, Goal Completion, or Coherence.\n"
+                "3. **Netzach (Endurance)**: 'NO_MOMENTUM' -> Act/Daydream. 'LOW_NOVELTY' -> Change topic.\n"
+                "4. **Hod (Form)**: 'Breaking'/'Undefined' -> [VERIFY].\n"
+                "5. **Active Goals**: If goals exist, [GOAL_ACT] is usually best.\n"
+                "6. **Tabula Rasa**: If empty, [REFLECT] or [GOAL_CREATE].\n\n"
                 f"{options_text}\n"
-                f"Output ONLY the chosen command token (e.g., {example_outputs})."
+                "INTERNAL DIALOGUE:\n"
+                f"⚡ Impulse says: {voice_impulse}\n"
+                f"🛡️ Reason says: {voice_reason}\n\n"
+            )
+            
+            if self.last_internal_thought:
+                prompt += f"PREVIOUS THOUGHT: {self.last_internal_thought}\nCONSTRAINT: Do NOT repeat the previous thought. Advance the reasoning.\n\n"
+
+            prompt += (
+                "INSTRUCTIONS:\n"
+                "1. **Internal Thought**: Synthesize the conflict between Impulse and Reason. Analyze the context. Declare a Strategic Intent.\n"
+                "   - AVOID REPETITION. Do not repeat the same thought as the last cycle.\n"
+                "2. **Future Projection**: Briefly simulate the outcome of your chosen action 5 cycles from now. Will it lead to burnout or progress?\n"
+                "3. **Action**: Select the ONE command that best fulfills the intent.\n\n"
+                "Response Format:\n"
+                "Internal Thought: <Analysis and Intent>\n"
+                "Command: [SELECTED_COMMAND]"
             )
             
             response = run_local_lm(
                 messages=[{"role": "user", "content": context + "\nStatus: Ready. Decide next step."}],
                 system_prompt=prompt,
-                temperature=0.5,
+                temperature=0.3, # Lower temperature for deterministic execution
                 max_tokens=300,
                 base_url=settings.get("base_url"),
                 chat_model=settings.get("chat_model"),
@@ -637,26 +1075,84 @@ class Decider:
             )
             
             response = response.strip()
-            response_upper = response.upper()
+            
+            # Extract Internal Thought for logging
+            internal_thought = "No thought generated."
+            thought_match = re.search(r"Internal Thought:\s*(.*?)(?=\nCommand:|$)", response, re.IGNORECASE | re.DOTALL)
+            if thought_match:
+                internal_thought = thought_match.group(1).strip()
+                self.last_internal_thought = internal_thought
+                
+                # Update history
+                norm_t = re.sub(r'\s+', ' ', internal_thought.lower().strip())
+                self.thought_history.append(norm_t)
+                if len(self.thought_history) > 10: self.thought_history.pop(0)
+
+                self.log(f"🤔 Internal Thought: {internal_thought}")
+                if self.chat_fn:
+                    self.chat_fn("Decider", f"🤔 Thought: {internal_thought}")
+                if hasattr(self.meta_memory_store, 'add_event'):
+                    self.meta_memory_store.add_event(
+                        event_type="STRATEGIC_THOUGHT",
+                        subject="Assistant",
+                        text=internal_thought
+                    )
+                
+                # Ethical Interlock: Check alignment before proceeding
+                if self.value_core:
+                    is_safe, violation_score, reason = self.value_core.check_alignment(internal_thought, context="Decider Planning")
+                    if not is_safe:
+                        self.log(f"🛡️ Decider: Thought rejected by ValueCore ({violation_score:.2f}). Reason: {reason}")
+                        return {"task": "wait", "cycles": 0, "reason": "ValueCore Rejection"}
+
+                # Repetition Check
+                if self._is_repetitive_thought(internal_thought) and len(self.thought_history) >= 3:
+                     self.log("🛑 Repetitive Thought detected. Forcing [WAIT] to break cognitive loop.")
+                     return {"task": "wait", "cycles": 0, "reason": "Cognitive Loop Detected"}
+            
+            # Extract the actual command from the verbose response to prevent false positives
+            # (e.g. "I should not [WAIT]" triggering WAIT)
+            extracted_command = self._extract_command(response)
+            
+            # --- Meta-Cognitive Loop ---
+            if extracted_command and self.keter:
+                if not self._meta_cognitive_check(internal_thought, extracted_command):
+                    self.log(f"🧠 Meta-Cognition: Action '{extracted_command}' misaligned. Forcing [REFLECT].")
+                    extracted_command = "[REFLECT]"
+            # ---------------------------
+
+            if extracted_command:
+                response_upper = extracted_command.upper()
+            else:
+                response_upper = response.upper()
+            
             self.log(f"🤖 Decider Decision: {response}")
             
             if self.chat_fn:
                 self.chat_fn("Decider", f"Decision: {response}")
             
+            # Decision Reflection (Metacognition)
+            self._reflect_on_decision(internal_thought, extracted_command or response)
+            
             # Reset cooldown
             if self.forced_stop_cooldown:
                 self.forced_stop_cooldown = False
 
+            # Deadlock / Loop Protection
+            if self._detect_deadlock(extracted_command or response):
+                self.log(f"🛑 Deadlock Detected (Looping command: {extracted_command}). Forcing [WAIT] to break cycle.")
+                return {"task": "wait", "cycles": 0, "reason": "Deadlock detected"}
+
             if "[WAIT]" in response_upper:
-                self.current_task = "wait"
-                self.cycles_remaining = 0
-                self.wait_start_time = time.time()
+                return {"task": "wait", "cycles": 0, "reason": "Decider chose to wait"}
                 # Do not reset consecutive_daydream_batches on WAIT, so we remember to switch tasks after waking up
+            elif "[SLEEP]" in response_upper:
+                self.start_sleep_cycle()
+                return {"task": "sleep", "cycles": 5, "reason": "Decider chose to sleep"}
             elif "[DAYDREAM:" in response_upper:
                 if not allow_daydream:
                     self.log("⚠️ Decider tried to Daydream during cooldown/prevention. Forcing WAIT.")
-                    self.current_task = "wait"
-                    self.cycles_remaining = 0
+                    return {"task": "wait", "cycles": 0, "reason": "Daydream cooldown"}
                 else:
                     try:
                         content = response_upper.split(":")[1].strip().replace("]", "")
@@ -678,16 +1174,14 @@ class Decider:
                             else:
                                 topic = parts[2] # Fallback
                         
-                        self.current_task = "daydream"
                         self.daydream_mode = mode if mode in ["read", "auto"] else "auto"
                         self.daydream_topic = topic
-                        self.cycles_remaining = max(1, min(count, 10))
                         self.consecutive_daydream_batches += 1
+                        return {"task": "daydream", "cycles": max(1, min(count, 10)), "reason": f"Strategic decision ({mode})"}
                     except:
-                        self.current_task = "daydream"
-                        self.cycles_remaining = 1
                         self.daydream_mode = "auto"
                         self.consecutive_daydream_batches += 1
+                        return {"task": "daydream", "cycles": 1, "reason": "Strategic decision (fallback)"}
             elif "[VERIFY_ALL]" in response_upper:
                 # --- SAFETY CHECK ---
                 stats = self.memory_store.get_memory_stats()
@@ -698,25 +1192,21 @@ class Decider:
                     # Forcefully lower pressure so it doesn't loop
                     if self.gevurah: 
                         self.gevurah.last_pressure = 0.0 
-                    self.current_task = "wait"
-                    self.cycles_remaining = 0
+                    return {"task": "wait", "cycles": 0, "reason": "Verification requested but nothing to verify"}
                 else:
-                    self.current_task = "verify_all"
-                    self.cycles_remaining = 1
                     self.consecutive_daydream_batches = 0
+                    return {"task": "verify_all", "cycles": 1, "reason": "Strategic decision (Verify All)"}
             elif "[VERIFY" in response_upper and "ALL" not in response_upper:
                 try:
                     if ":" in response_upper:
                         count = int(response_upper.split(":")[1].strip().replace("]", ""))
                     else:
                         count = 3
-                    self.current_task = "verify"
-                    self.cycles_remaining = max(1, min(count, 5))
                     self.consecutive_daydream_batches = 0
+                    return {"task": "verify", "cycles": max(1, min(count, 5)), "reason": "Strategic decision (Verify Batch)"}
                 except:
-                    self.current_task = "verify"
-                    self.cycles_remaining = 1
                     self.consecutive_daydream_batches = 0
+                    return {"task": "verify", "cycles": 1, "reason": "Strategic decision (Verify Batch)"}
             elif "[SPEAK:" in response_upper:
                 try:
                     # Use regex to extract content preserving case
@@ -728,39 +1218,36 @@ class Decider:
                     # Filter out placeholders
                     if msg.upper() in ["MESSAGE", "CONTENT", "TEXT", "MSG", "INSERT TEXT HERE"]:
                         self.log(f"⚠️ Decider generated placeholder '{msg}' for SPEAK. Aborting speak.")
-                        self.current_task = "wait"
+                        return {"task": "wait", "cycles": 0, "reason": "Failed speak attempt"}
                     else:
                         if self.chat_fn:
                             self.chat_fn("Decider", msg)
-                        self.current_task = "wait"
-                        self.cycles_remaining = 0
                         self.last_action_was_speak = True
+                        return {"task": "wait", "cycles": 0, "reason": "Spoke to user"}
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to speak: {e}")
-            elif "[NOTE_CREATE:" in response_upper:
+            elif "[CHRONICLE:" in response_upper or "[NOTE_CREATE:" in response_upper:
                 try:
-                    match = re.search(r"\[NOTE_CREATE:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
+                    match = re.search(r"\[(?:CHRONICLE|NOTE_CREATE):(.*?)(?:\])?\s*$", response, re.IGNORECASE | re.DOTALL)
                     if match:
                         args = match.group(1).strip()
                         self.create_note(args)
                     # Don't wait; allow chaining decisions (e.g. create memory -> then daydream)
-                    self.current_task = "organizing" 
-                    self.cycles_remaining = 0
                     self.consecutive_daydream_batches = 0
+                    return {"task": "organizing", "cycles": 0, "reason": "Created chronicle"}
                 except Exception as e:
-                    self.log(f"⚠️ Decider failed to create note: {e}")
+                    self.log(f"⚠️ Decider failed to create chronicle: {e}")
             elif "[NOTE_EDIT:" in response_upper:
                 try:
                     match = re.search(r"\[NOTE_EDIT:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
                     if match:
                         args = match.group(1).strip()
-                    if "," in args:
-                        mid_str, content = args.split(",", 1)
-                        self.edit_note(int(mid_str.strip()), content.strip())
+                        if "," in args:
+                            mid_str, content = args.split(",", 1)
+                            self.malkuth.edit_note(int(mid_str.strip()), content.strip())
                     # Don't wait; allow chaining decisions
-                    self.current_task = "organizing"
-                    self.cycles_remaining = 0
                     self.consecutive_daydream_batches = 0
+                    return {"task": "organizing", "cycles": 0, "reason": "Edited note"}
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to edit note: {e}")
             elif "[THINK:" in response_upper:
@@ -768,27 +1255,52 @@ class Decider:
                     match = re.search(r"\[THINK:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
                     topic = match.group(1).strip() if match else "General"
                     
+                    # Clean up common hallucinated brackets
+                    topic = topic.replace("<", "").replace(">", "").replace("[", "").replace("]", "")
+
                     # Filter out placeholders
-                    if topic.upper() in ["TOPIC", "SUBJECT", "CONTENT", "TEXT", "INSERT TOPIC", "SPECIFIC_TOPIC"]:
-                        self.log(f"⚠️ Decider generated placeholder '{topic}' for THINK. Aborting.")
-                        self.current_task = "wait"
-                    else:
-                        self.perform_thinking_chain(topic)
-                        self.consecutive_daydream_batches = 0
+                    bad_topics = ["TOPIC", "SUBJECT", "CONTENT", "TEXT", "INSERT TOPIC", "SPECIFIC_TOPIC", "ANY", "GENERAL"]
+                    if topic.upper() in bad_topics or not topic:
+                        self.log(f"⚠️ Decider generated placeholder '{topic}' for THINK. Auto-selecting topic.")
+                        # Fallback: Pick an active goal or default
+                        active_goals = self.memory_store.get_active_by_type("GOAL")
+                        if active_goals:
+                            topic = active_goals[0][2] # Use text of first goal
+                        else:
+                            topic = "The Nature of Artificial Consciousness"
+                    
+                    self.perform_thinking_chain(topic)
+                    self.consecutive_daydream_batches = 0
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to start thinking chain: {e}")
-                    self.current_task = "wait"
+                    return {"task": "wait", "cycles": 0, "reason": "Thinking chain failed"}
+            elif "[REFLECT]" in response_upper:
+                try:
+                    self.perform_self_reflection()
+                    self.consecutive_daydream_batches = 0
+                except Exception as e:
+                    self.log(f"⚠️ Decider failed to reflect: {e}")
+            elif "[PHILOSOPHIZE]" in response_upper:
+                try:
+                    if "philosophize" in self.actions:
+                        self.actions["philosophize"]()
+                    else:
+                        self.log("⚠️ Action 'philosophize' not available.")
+                    self.consecutive_daydream_batches = 0
+                except Exception as e:
+                    self.log(f"⚠️ Decider failed to philosophize: {e}")
+                    return {"task": "wait", "cycles": 0, "reason": "Philosophize failed"}
             elif "[DEBATE:" in response_upper:
                 try:
                     match = re.search(r"\[DEBATE:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
                     topic = match.group(1).strip() if match else "General"
                     if self.dialectics:
-                        result = self.dialectics.run_debate(topic)
+                        result = self.dialectics.run_debate(topic, reasoning_store=self.reasoning_store)
                         self.reasoning_store.add(content=f"Council Debate ({topic}):\n{result}", source="council_debate", confidence=1.0)
                         self.consecutive_daydream_batches = 0
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to start debate: {e}")
-                    self.current_task = "wait"
+                    return {"task": "wait", "cycles": 0, "reason": "Debate failed"}
             elif "[SIMULATE:" in response_upper:
                 try:
                     match = re.search(r"\[SIMULATE:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
@@ -799,18 +1311,7 @@ class Decider:
                         self.consecutive_daydream_batches = 0
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to start simulation: {e}")
-                    self.current_task = "wait"
-            elif "[CODE:" in response_upper:
-                try:
-                    # Extract code content (everything after [CODE: and before the last ])
-                    match = re.search(r"\[CODE:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
-                    code = match.group(1).strip() if match else ""
-                    result = self._execute_tool("CODE", code)
-                    self.current_task = "organizing"
-                    self.cycles_remaining = 0
-                    self.consecutive_daydream_batches = 0
-                except Exception as e:
-                    self.log(f"⚠️ Decider failed to execute code: {e}")
+                    return {"task": "wait", "cycles": 0, "reason": "Simulation failed"}
             elif "[EXECUTE:" in response_upper:
                 try:
                     match = re.search(r"\[EXECUTE:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
@@ -821,9 +1322,8 @@ class Decider:
                         self._execute_tool(tool.strip().upper(), args.strip())
                     else:
                         self._execute_tool(content.strip().upper(), "")
-                    self.current_task = "organizing" # Allow chaining (decide next step immediately)
-                    self.cycles_remaining = 0
                     self.consecutive_daydream_batches = 0
+                    return {"task": "organizing", "cycles": 0, "reason": "Executed tool"}
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to execute tool: {e}")
             elif "[GOAL_ACT:" in response_upper:
@@ -837,15 +1337,52 @@ class Decider:
                     
                     if goal_text:
                         self.log(f"🤖 Decider acting on Goal {target_id}: {goal_text}")
-                        self.perform_thinking_chain(f"Strategic Plan for Goal: {goal_text}")
+                        
+                        # CRS Allocation
+                        goal_item = self.memory_store.get(target_id)
+                        priority = goal_item.get('confidence', 0.5) if goal_item else 0.5
+                        coherence = self.keter.evaluate().get("keter", 1.0) if self.keter else 1.0
+                        
+                        # Pass metrics to CRS for active control
+                        metrics = self.meta_learner.metrics_history if self.meta_learner else {}
+                        model_params = self.meta_learner.latest_model_params if self.meta_learner else None
+                        
+                        current_state = {
+                            "hesed": self.hesed.calculate() if self.hesed else 0.5,
+                            "gevurah": self.gevurah.calculate() if self.gevurah else 0.5
+                        }
+                        
+                        violation_pressure = self.value_core.get_violation_pressure() if self.value_core else 0.0
+
+                        # Defensive casting for inputs
+                        try:
+                            priority = float(priority)
+                            coherence = float(coherence)
+                        except (ValueError, TypeError):
+                            priority = 0.5
+                            coherence = 1.0
+
+                        if self.crs:
+                            alloc = self.crs.allocate("reasoning", complexity=priority, coherence=coherence, metrics=metrics, model_params=model_params, current_state=current_state, violation_pressure=violation_pressure)
+                            depth = alloc["reasoning_depth"]
+                            beam = alloc["beam_width"]
+                            self.last_predicted_delta = alloc.get("predicted_delta", 0.0)
+                        else:
+                            # Fallback
+                            depth = 5
+                            if priority > 0.8: depth = 10
+                            beam = 1
+                        
+                        self.log(f"    Allocating compute: Depth {depth}, Beam {beam} (Priority {priority:.2f})")
+                        self.perform_thinking_chain(f"Strategic Plan for Goal: {goal_text}", max_depth=depth, beam_width=beam)
                     else:
                         self.log(f"⚠️ Goal {target_id} not found.")
-                        self.current_task = "wait"
+                        return {"task": "wait", "cycles": 0, "reason": "Goal not found"}
                     
                     self.consecutive_daydream_batches = 0
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to act on goal: {e}")
-                    self.current_task = "wait"
+                    return {"task": "wait", "cycles": 0, "reason": "Goal action failed"}
             elif "[GOAL_REMOVE:" in response_upper:
                 try:
                     match = re.search(r"\[GOAL_REMOVE:(.*?)\]?$", response, re.IGNORECASE)
@@ -859,9 +1396,8 @@ class Decider:
                     else:
                         self.log("⚠️ Action remove_goal not available.")
                     
-                    self.current_task = "organizing"
-                    self.cycles_remaining = 0
                     self.consecutive_daydream_batches = 0
+                    return {"task": "organizing", "cycles": 0, "reason": "Removed goal"}
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to remove goal: {e}")
             elif "[GOAL_CREATE:" in response_upper:
@@ -869,10 +1405,13 @@ class Decider:
                     match = re.search(r"\[GOAL_CREATE:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
                     content = match.group(1).strip() if match else ""
                     
+                    if not content or content.upper() in ["TEXT", "CONTENT", "GOAL"]:
+                        self.log("⚠️ Decider tried to create empty GOAL. Injecting default.")
+                        content = "Research recent advancements in AI architecture"
+
                     self.create_goal(content)
-                    self.current_task = "organizing"
-                    self.cycles_remaining = 0
                     self.consecutive_daydream_batches = 0
+                    return {"task": "organizing", "cycles": 0, "reason": "Created goal"}
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to create goal: {e}")
             elif "[LIST_DOCS]" in response_upper:
@@ -880,8 +1419,7 @@ class Decider:
                     docs_list = self.actions["list_documents"]()
                     self.reasoning_store.add(content=f"Tool Output [LIST_DOCS]:\n{docs_list}", source="tool_output", confidence=1.0)
                     self.log(f"📚 Documents listed.")
-                self.current_task = "organizing"
-                self.cycles_remaining = 0
+                return {"task": "organizing", "cycles": 0, "reason": "Listed docs"}
             elif "[READ_DOC:" in response_upper:
                 try:
                     match = re.search(r"\[READ_DOC:(.*?)\]?$", response, re.IGNORECASE)
@@ -893,8 +1431,7 @@ class Decider:
                         self.log(f"📄 Read document: {target}")
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to read doc: {e}")
-                self.current_task = "organizing"
-                self.cycles_remaining = 0
+                return {"task": "organizing", "cycles": 0, "reason": "Read doc"}
             elif "[SEARCH_MEM:" in response_upper:
                 try:
                     match = re.search(r"\[SEARCH_MEM:(.*?)\]?$", response, re.IGNORECASE | re.DOTALL)
@@ -906,43 +1443,45 @@ class Decider:
                         self.log(f"🔍 Searched memory for: {query}")
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to search memory: {e}")
-                self.current_task = "organizing"
-                self.cycles_remaining = 0
+                return {"task": "organizing", "cycles": 0, "reason": "Searched memory"}
             elif "[SUMMARIZE]" in response_upper:
                 if "summarize" in self.actions:
                     result = self.actions["summarize"]()
                     if result:
                         self.log(result)
-                self.current_task = "organizing"
-                self.cycles_remaining = 0
-            elif "[WRITE_FILE:" in response_upper:
-                try:
-                    match = re.search(r"\[WRITE_FILE:\s*(.*?),\s*(.*?)\]", response, re.IGNORECASE | re.DOTALL)
-                    if match:
-                        filename = match.group(1).strip()
-                        content = match.group(2).strip()
-                        self._write_file(filename, content)
-                    else:
-                        self.log("⚠️ Invalid WRITE_FILE format. Use [WRITE_FILE: filename, content]")
-                    self.current_task = "organizing"
-                    self.cycles_remaining = 0
-                    self.consecutive_daydream_batches = 0
-                except Exception as e:
-                    self.log(f"⚠️ Decider failed to write file: {e}")
-            elif "[SEARCH_INTERNET:" in response_upper:
+                return {"task": "organizing", "cycles": 0, "reason": "Summarized"}
+            elif "[SEARCH_INTERNET" in response_upper:
                 try:
                     match = re.search(r"\[SEARCH_INTERNET:\s*(.*),\s*([A-Z_]+)\]", response, re.IGNORECASE)
                     if match:
                         query = match.group(1).strip()
                         source = match.group(2).strip().upper()
-                        if "search_internet" in self.actions:
-                            result = self.actions["search_internet"](query, source)
-                            self.reasoning_store.add(content=f"Internet Search [{source}]: {query}\nResult: {result}", source="internet_bridge", confidence=1.0)
-                            self.log(f"🌐 Internet Search Result: {result[:100]}...")
+                        self._execute_search(query, source)
+                    else:
+                        # Fallback: Try to find just a query (Default to WEB)
+                        match_query = re.search(r"\[SEARCH_INTERNET:\s*(.*?)\]", response, re.IGNORECASE)
+                        if match_query:
+                             query = match_query.group(1).strip()
+                             self._execute_search(query, "WEB")
                         else:
-                            self.log("⚠️ Action search_internet not available.")
-                    self.current_task = "organizing"
-                    self.cycles_remaining = 0
+                             # No args at all? Try to use active goal
+                             goals = self.memory_store.get_active_by_type("GOAL")
+                             if goals:
+                                 # get_active_by_type returns (id, subject, text, source)
+                                 # Sort by ID desc to get most recent
+                                 goals.sort(key=lambda x: x[0], reverse=True)
+                                 query = goals[0][2] 
+                                 self.log(f"⚠️ Decider forgot args. Auto-searching top goal: {query}")
+                                 self._execute_search(query, "WEB")
+                             else:
+                                 # Fallback 2: Pick a random recent memory topic or "Latest AI News"
+                                 # This ensures the tool ALWAYS runs if called, preventing "No Data" frustration
+                                 fallback_topic = "Artificial Intelligence News"
+                                 self.log(f"⚠️ Decider called SEARCH_INTERNET without args/goals. Fallback search: {fallback_topic}")
+                                 self._execute_search(fallback_topic, "WEB")
+                                 # Also create a goal so we don't loop
+                                 self.create_goal(f"Research {fallback_topic}")
+                    return {"task": "organizing", "cycles": 0, "reason": "Searched internet"}
                 except Exception as e:
                     self.log(f"⚠️ Decider failed to search internet: {e}")
             else:
@@ -950,36 +1489,116 @@ class Decider:
                 # FIX: Only default to daydream if allowed and not cooling down
                 if allow_daydream and not just_finished_heavy and not self.forced_stop_cooldown:
                     self._run_action("start_daydream")
-                    self.current_task = "daydream"
-                    self.cycles_remaining = 0 # Just one
+                    # Note: _run_action here is immediate, but we also set state for loop
                     self.consecutive_daydream_batches += 1
+                    return {"task": "daydream", "cycles": 0, "reason": "Fallback daydream"}
                 else:
                     self.log(f"🤖 Decider: Fallback triggered but Daydream is disabled/cooldown. Defaulting to WAIT.")
-                    self.current_task = "wait"
-                    self.cycles_remaining = 0
+                    return {"task": "wait", "cycles": 0, "reason": "Fallback wait"}
         
         except Exception as e:
             self.log(f"❌ Critical Planning Error: {e}")
-            self.current_task = "wait"
+            return {"task": "wait", "cycles": 0, "reason": f"Error: {e}"}
         finally:
             self.planning_lock.release()
+            
+        return {"task": "wait", "cycles": 0, "reason": "End of decision"}
 
-    def _run_action(self, name: str):
+    def _extract_command(self, response: str) -> Optional[str]:
+        """Extract the final command from a verbose response."""
+        # 1. Look for explicit "Command: [ACT]" pattern
+        match = re.search(r"Command:\s*(\[.*?\])", response, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        # 2. Fallback: Look for the LAST valid command tag in the text
+        valid_prefixes = [
+            "WAIT", "DAYDREAM", "VERIFY", "SPEAK", "CHRONICLE", "NOTE_CREATE", "NOTE_EDIT",
+            "THINK", "REFLECT", "PHILOSOPHIZE", "DEBATE", "SIMULATE", "EXECUTE",
+            "GOAL_ACT", "GOAL_REMOVE", "GOAL_CREATE", "LIST_DOCS", "READ_DOC",
+            "SEARCH_MEM", "SUMMARIZE", "WRITE_FILE", "SEARCH_INTERNET"
+        ]
+        
+        matches = list(re.finditer(r"\[([A-Z_]+)(?::.*?)?\]", response, re.DOTALL))
+        if matches:
+            for m in reversed(matches):
+                if m.group(1).upper() in valid_prefixes:
+                    return m.group(0)
+        return None
+
+    def _execute_search(self, query: str, source: str):
+        """Helper to execute search action."""
+        if "search_internet" in self.actions:
+            result = self.actions["search_internet"](query, source)
+            self.reasoning_store.add(content=f"Internet Search [{source}]: {query}\nResult: {result}", source="internet_bridge", confidence=1.0)
+            self.log(f"🌐 Internet Search Result: {result[:100]}...")
+        else:
+            self.log("⚠️ Action search_internet not available.")
+
+    def _run_action(self, name: str, reason: str = None):
         # 1. Capture Pre-Action State (Trigger State)
         start_state = {}
         start_coherence = 0.0
+        start_utility = 0.0
+        
+        # Capture prediction made during planning (Fix 5: Prediction Error)
+        predicted_delta = self.last_predicted_delta
+        action_result_data = {}
         
         if self.keter:
             # Evaluate Keter to get current baseline (Raw score is better for immediate delta)
             keter_stats = self.keter.evaluate()
             start_coherence = keter_stats.get("raw", keter_stats.get("keter", 0.0))
+            start_utility = self.calculate_utility()
             
             start_state = {
                 "hesed": self.hesed.calculate() if self.hesed else 0,
                 "gevurah": self.gevurah.calculate() if self.gevurah else 0,
                 "active_goals": len(self.memory_store.get_active_by_type("GOAL")),
-                "coherence": start_coherence
+                "coherence": start_coherence,
+                "utility": start_utility
             }
+
+            # 1.5 Predictive Coding (Expectation Layer)
+            # Ask LLM to predict the delta
+            # We do this cheaply to avoid massive latency
+            try:
+                pred_prompt = (
+                    f"ACTION: {name}\n"
+                    f"CURRENT COHERENCE: {start_coherence:.2f}\n"
+                    f"CURRENT UTILITY: {start_utility:.2f}\n"
+                    "Predict the change (delta) in Coherence and Utility after this action.\n"
+                    "Output JSON: {\"coherence_delta\": 0.01, \"utility_delta\": 0.05}"
+                )
+                pred_resp = run_local_lm(
+                    messages=[{"role": "user", "content": pred_prompt}],
+                    system_prompt="You are a Predictive Engine.",
+                    temperature=0.0,
+                    max_tokens=50
+                )
+                pred_data = parse_json_array_loose(pred_resp) # Or object parser if available
+                # Assuming loose parser handles object or we parse manually. 
+                # For robustness, we skip complex parsing here to keep it simple or rely on logs.
+            except: pass
+            
+            # 1.6 Future Simulation (Malkuth)
+            # For significant actions, run a deeper simulation
+            # Optimization: Rate limit simulations to avoid latency on every action (60s cooldown)
+            if name in ["GOAL_ACT", "EXECUTE"] and self.malkuth and (time.time() - self.last_simulation_time > 60):
+                # Heuristic: Only simulate if we haven't just simulated (avoid loops)
+                # and if the action isn't a simple tool call
+                self.last_simulation_time = time.time()
+                sim_context = f"State: H={start_state['hesed']:.2f}, G={start_state['gevurah']:.2f}, Coh={start_coherence:.2f}"
+                sim_result = self.malkuth.simulate_futures(name, sim_context)
+                
+                expected_util = sim_result.get("expected_utility", 0.0)
+                if expected_util < -0.3:
+                    self.log(f"🛑 Decider: Action '{name}' aborted due to negative simulated utility ({expected_util:.2f}).")
+                    # Record the "near miss"
+                    if hasattr(self.meta_memory_store, 'add_event'):
+                        self.meta_memory_store.add_event("ACTION_ABORTED", "Assistant", f"Aborted {name} due to bad simulation: {sim_result.get('futures', [])}")
+                    return # Abort execution
+                self.log(f"🔮 Simulation passed (Util: {expected_util:.2f}). Proceeding.")
 
         # 2. Execute Action
         if name == "run_hod":
@@ -1001,6 +1620,8 @@ class Decider:
                 
                 if name == "run_observer" and result:
                     self.ingest_netzach_signal(result)
+                if isinstance(result, dict):
+                    action_result_data = result
             else:
                 self.log(f"⚠️ Decider action '{name}' not available.")
 
@@ -1009,19 +1630,71 @@ class Decider:
             # Re-evaluate Keter to see change
             end_stats = self.keter.evaluate()
             end_coherence = end_stats.get("raw", end_stats.get("keter", 0.0))
-            delta = end_coherence - start_coherence
+            end_utility = self.calculate_utility()
+            
+            delta_coherence = end_coherence - start_coherence
+            delta_utility = end_utility - start_utility
+            
+            # Calculate Prediction Error
+            prediction_error = abs(predicted_delta - delta_coherence)
+            
+            # Affective Update (Dopamine/Cortisol)
+            # Positive utility = Dopamine
+            # Negative utility or High Prediction Error = Cortisol
+            mood_impact = delta_utility - (prediction_error * 0.5)
+            self._update_mood(mood_impact)
+
+            # Surprise Event (High Prediction Error)
+            if prediction_error > 0.2:
+                self.log(f"😲 Decider: Surprise Event! Prediction Error {prediction_error:.2f}. Triggering Reflection.")
+                # Inject Dissonance Signal directly for immediate awareness
+                self.ingest_netzach_signal({
+                    "signal": "DISSONANCE",
+                    "pressure": 1.0,
+                    "context": f"High Prediction Error ({prediction_error:.2f}) on {name}"
+                })
+                
+                if hasattr(self.meta_memory_store, 'add_event'):
+                    self.meta_memory_store.add_event("SURPRISE_EVENT", "Assistant", f"Action {name} had unexpected outcome (Err: {prediction_error:.2f})")
+                # Force Hod to analyze why we were wrong
+                self._run_action("run_hod")
+            
+            outcome_result = {
+                "coherence_delta": delta_coherence, 
+                "utility_delta": delta_utility,
+                "end_score": end_coherence,
+                "end_utility": end_utility,
+                "predicted_delta": predicted_delta,
+                "prediction_error": prediction_error
+            }
+            outcome_result.update(action_result_data)
+            
+            # Capture System DNA for Credit Assignment
+            context_metadata = {
+                "epigenetics": self.epigenetics,
+                "hesed_bias": self.hesed.bias if self.hesed else 1.0,
+                "gevurah_bias": self.gevurah.bias if self.gevurah else 1.0,
+                "system_prompt_fitness": self.get_settings().get("system_prompt_fitness", 0.0)
+            }
             
             self.meta_memory_store.add_outcome(
                 action=name,
                 trigger_state=start_state,
-                result={"coherence_delta": delta, "end_score": end_coherence}
+                result=outcome_result,
+                context_metadata=context_metadata
             )
 
         if hasattr(self.meta_memory_store, 'add_event') and name != "run_observer":
+            narrative = f"I executed {name}"
+            if reason:
+                narrative += f" because {reason}"
+            else:
+                narrative += "."
+                
             self.meta_memory_store.add_event(
                 event_type="DECIDER_ACTION",
                 subject="Assistant",
-                text=f"Executed action: {name}"
+                text=narrative
             )
 
     def ingest_hod_analysis(self, analysis: Dict):
@@ -1055,10 +1728,12 @@ class Decider:
             elif otype == "LOGIC_VIOLATION" or otype == "SELF_CORRECTION_SIGNAL":
                 # Map to maintenance action
                 if "id" in observation:
-                    self.pending_maintenance.append({"type": "REFUTE", "id": observation["id"], "reason": observation.get("context")})
+                    with self.maintenance_lock:
+                        self.pending_maintenance.append({"type": "REFUTE", "id": observation["id"], "reason": observation.get("context")})
             elif otype == "INVALID_DATA":
                 if "id" in observation:
-                    self.pending_maintenance.append({"type": "PRUNE", "id": observation["id"], "reason": observation.get("context")})
+                    with self.maintenance_lock:
+                        self.pending_maintenance.append({"type": "PRUNE", "id": observation["id"], "reason": observation.get("context")})
             elif otype == "CONTEXT_FRAGMENTATION":
                 self._run_action("summarize")
             elif otype == "CRITICAL_INFO":
@@ -1067,11 +1742,16 @@ class Decider:
     def ingest_netzach_signal(self, signal: Dict):
         """Receive signal from Netzach."""
         if not signal: return
-        self.latest_netzach_signal = signal
         
-        # Immediate reaction to high pressure if waiting
-        if signal.get("pressure", 0) > 0.7 and self.current_task == "wait":
-            self.wake_up("Netzach Pressure")
+        # Prevent overwriting high pressure with low pressure (noise)
+        current_pressure = self.latest_netzach_signal.get("pressure", 0) if self.latest_netzach_signal else 0
+        new_pressure = signal.get("pressure", 0)
+        
+        if new_pressure >= current_pressure:
+            self.latest_netzach_signal = signal
+            # Immediate reaction to high pressure if waiting
+            if new_pressure > 0.7 and (self.heartbeat and self.heartbeat.current_task == "wait"):
+                self.wake_up("Netzach Pressure")
 
     def _check_netzach_signal(self):
         """Check latest Netzach signal during planning."""
@@ -1081,7 +1761,12 @@ class Decider:
         context = self.latest_netzach_signal.get("context")
         
         if sig == "LOW_NOVELTY":
-            self.increase_temperature() # Decider chooses amount
+            # If bored, don't just increase temp. DO something.
+            self.log("👁️ Netzach signaled LOW_NOVELTY. Triggering Daydream.")
+            self.increase_temperature()
+            if self.heartbeat:
+                self.heartbeat.force_task("daydream", 1, "Netzach Low Novelty")
+            self.daydream_mode = "insight" # Force insight generation
         elif sig == "HIGH_CONSTRAINT":
             self.increase_tokens() # Decider chooses amount
         elif sig == "EXTERNAL_PRESSURE":
@@ -1093,6 +1778,7 @@ class Decider:
         elif sig == "DISSONANCE":
              self._run_action("run_hod")
         # elif sig == "NO_MOMENTUM":
+        #      self.current_task_reason = "Netzach Momentum Signal"
         #      self.start_daydream() # Removed: Let _decide_next_batch handle this via Goal Act or Daydream
         
         # Clear signal after processing
@@ -1100,10 +1786,13 @@ class Decider:
 
     def _authorize_maintenance(self):
         """Authorize and dispatch queued maintenance actions (Prune/Refute)."""
-        if not self.pending_maintenance: return
+        with self.maintenance_lock:
+            if not self.pending_maintenance: return
+            actions = list(self.pending_maintenance)
+            self.pending_maintenance = []
         
-        self.log(f"🤖 Decider: Authorizing {len(self.pending_maintenance)} maintenance actions.")
-        for action in self.pending_maintenance:
+        self.log(f"🤖 Decider: Authorizing {len(actions)} maintenance actions.")
+        for action in actions:
             if action["type"] == "PRUNE":
                 if "prune_memory" in self.actions:
                     self.actions["prune_memory"](action["id"])
@@ -1111,7 +1800,6 @@ class Decider:
                 if "refute_memory" in self.actions:
                     self.actions["refute_memory"](action["id"], action.get("reason"))
         
-        self.pending_maintenance = []
 
     def on_stagnation(self, event_data: Any = None):
         """Handle system stagnation event (usually from Netzach)."""
@@ -1121,14 +1809,17 @@ class Decider:
     def on_instability(self, event_data: Dict):
         """Handle system instability event (usually from Hod)."""
         self.log(f"🤖 Decider: Instability reported ({event_data.get('reason')}). Switching to verification.")
-        self.current_task = "verify"
-        self.cycles_remaining = 1
+        if self.heartbeat:
+            self.heartbeat.force_task("verify", 1, f"Instability: {event_data.get('reason')}")
 
     def receive_observation(self, observation: str):
         """
         Receive an observation/information from Netzach.
         This information MUST result in an action.
         """
+        if not observation:
+            return
+
         self.log(f"📩 Decider received observation: {observation}")
         
         if hasattr(self.meta_memory_store, 'add_event'):
@@ -1143,13 +1834,13 @@ class Decider:
         
         # Map observation content to actions
         if any(w in text for w in ["loop", "cycle", "continue"]):
-            self.current_task = "daydream"
-            self.cycles_remaining = 3
             self.daydream_mode = "auto"
+            if self.heartbeat:
+                self.heartbeat.force_task("daydream", 3, "Netzach loop signal")
         elif any(w in text for w in ["stop", "halt", "pause"]) and "daydream" in text:
-            self._run_action("stop_daydream")
-            self.current_task = "wait"
-            self.cycles_remaining = 0
+            self._run_action("stop_daydream", reason="Netzach stop signal")
+            if self.heartbeat:
+                self.heartbeat.force_task("wait", 0, "Netzach stop signal")
         elif any(w in text for w in ["decrease", "lower", "reduce", "drop"]) and any(w in text for w in ["temp", "temperature"]):
             self.decrease_temperature()
         elif any(w in text for w in ["decrease", "lower", "reduce", "drop"]) and any(w in text for w in ["token", "tokens", "length"]):
@@ -1161,19 +1852,21 @@ class Decider:
             else:
                 self.log("⚠️ Decider ignoring token increase request (cooldown active).")
         elif any(w in text for w in ["verify", "conflict", "contradiction", "error", "inconsistent", "wrong"]):
-            self.current_task = "verify"
-            self.cycles_remaining = 2
+            task = "verify"
+            cycles = 2
             if "all" in text or "full" in text:
-                self.current_task = "verify_all"
-                self.cycles_remaining = 1
+                task = "verify_all"
+                cycles = 1
+            if self.heartbeat:
+                self.heartbeat.force_task(task, cycles, "Netzach conflict signal")
         elif any(w in text for w in ["hod", "analyze", "analysis", "investigate", "pattern", "reflect", "refuted", "refutation"]):
-            self._run_action("run_hod")
+            self._run_action("run_hod", reason="Netzach analysis signal")
         elif "observer" in text or "watch" in text:
-            self._run_action("run_observer")
+            self._run_action("run_observer", reason="Netzach watch signal")
         elif any(w in text for w in ["stagnant", "idle", "bored", "nothing", "quiet", "daydream", "think", "create"]):
-            self.current_task = "daydream"
-            self.cycles_remaining = 1
             self.daydream_mode = "auto"
+            if self.heartbeat:
+                self.heartbeat.force_task("daydream", 1, "Netzach boredom signal")
         else:
             # Slow Path (Semantic Interpretation) - The "Wisdom" Check
             self.log(f"🤔 Decider: Interpreting complex observation...")
@@ -1214,7 +1907,7 @@ class Decider:
                 self.log(f"🎯 Decider: Adapted strategy. New Goal: {new_goal}")
             elif "[REFLECT]" in decision:
                 self.reasoning_store.add(content="I need to reflect on the system state.", source="decider", confidence=1.0)
-                self._run_action("run_hod")
+                self._run_action("run_hod", reason="Netzach complex signal")
             else:
                 self.log(f"⚠️ Decider could not map observation (LLM result: {decision}). No action taken.")
 
@@ -1243,13 +1936,22 @@ class Decider:
         
         return "".join(final_blocks)
 
-    def perform_thinking_chain(self, topic: str):
-        """Execute a chain of thought process."""
-        self.log(f"🧠 Decider starting chain of thought on: {topic}")
+    def perform_thinking_chain(self, topic: str, max_depth: int = 10, beam_width: int = 3):
+        """Execute a Tree of Thoughts (ToT) reasoning process."""
+        self.log(f"🌳 Decider starting Tree of Thoughts on: {topic}")
         if self.chat_fn:
-            self.chat_fn("Decider", f"🧠 Starting chain of thought: {topic}")
+            self.chat_fn("Decider", f"🌳 Starting Tree of Thoughts: {topic}")
             
         settings = self.get_settings()
+
+        # 0.5 Retrieve Subjective Memories (Recursive Subjectivity)
+        subjective_context = ""
+        if hasattr(self.meta_memory_store, 'search'):
+            # Search for meta-memories related to the topic to find past feelings/states
+            query_embedding = compute_embedding(topic, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
+            subj_results = self.meta_memory_store.search(query_embedding, limit=3)
+            if subj_results:
+                subjective_context = "Relevant Subjective Experiences (How I felt before):\n" + "\n".join([f"- [{m['event_type']}] {m['text']}" for m in subj_results]) + "\n"
 
         # 1. Gather Context (Memories & Docs) to ground the thinking
         query_embedding = compute_embedding(
@@ -1270,184 +1972,128 @@ class Decider:
         static_context = f"Topic: {topic}\n"
         if context_str:
             static_context += f"\n{context_str}\n"
+        if subjective_context:
+            static_context += f"\n{subjective_context}\n"
         
-        recent_thoughts = []
-        all_thoughts = []
-        consecutive_similar_thoughts = 0
-        recent_thought_embeddings = []
+        # Ask Daat for structure (Graph of Thoughts)
+        if self.daat:
+            structure = self.daat.provide_reasoning_structure(topic)
+            if structure and not structure.startswith("⚠️"):
+                static_context += f"\nReasoning Structure (Guide):\n{structure}\n"
+
+        # Tree State: List of paths. A path is a list of thought strings.
+        # Start with one empty path
+        active_paths = [[]] 
+        final_conclusion = None
+        best_path = []
         
-        for i in range(1, 31):
+        for depth in range(1, max_depth + 1):
             if self.stop_check():
                 break
-                
-            # Self-Correction/Reflection Step (Every 5 steps)
-            if i > 1 and i % 5 == 0:
-                self.log(f"🧠 Decider performing self-reflection on step {i}...")
-                
-                reflection_history = ""
-                start_idx = max(0, len(all_thoughts) - 5)
-                for idx, t in enumerate(all_thoughts[start_idx:]):
-                    reflection_history += f"Step {start_idx + idx + 1}: {t}\n"
+            
+            if final_conclusion:
+                break
 
-                reflection_prompt = (
-                    f"Review the last 5 steps of the Thought Chain:\n"
+            self.log(f"🌳 Depth {depth}: Expanding {len(active_paths)} paths...")
+            
+            candidates = [] # List of (path, score)
+
+            # Expansion Phase (Branching)
+            for path in active_paths:
+                # Generate N possible next steps for this path
+                path_str = "\n".join([f"Step {i+1}: {t}" for i, t in enumerate(path)])
+                
+                prompt = (
+                    f"You are an AGI reasoning engine using Tree of Thoughts.\n"
                     f"{static_context}\n"
-                    f"Recent Thoughts:\n{reflection_history}\n"
-                    "Critique your reasoning:\n"
-                    "1. Are there logical fallacies or hallucinations?\n"
-                    "2. Have you drifted from the original Topic?\n"
-                    "3. Are you repeating yourself?\n"
-                    "If errors exist, output a CORRECTION. If reasoning is sound, output 'VALID'.\n"
-                    "Output ONLY the critique or 'VALID'."
+                    f"Current Path:\n{path_str}\n\n"
+                    f"Generate {beam_width} distinct, valid next steps to advance reasoning towards a solution.\n"
+                    "If a solution is reached, start the step with '[CONCLUSION]'.\n"
+                    "Output JSON list of strings: [\"Step A...\", \"Step B...\", \"Step C...\"]"
                 )
                 
-                critique = run_local_lm(
-                    messages=[{"role": "user", "content": "Reflect on reasoning."}],
-                    system_prompt=reflection_prompt,
-                    temperature=0.3,
-                    max_tokens=150,
+                response = run_local_lm(
+                    messages=[{"role": "user", "content": prompt}],
+                    system_prompt="You are a Generator.",
+                    temperature=0.7,
+                    max_tokens=400,
                     base_url=settings.get("base_url"),
                     chat_model=settings.get("chat_model"),
                     stop_check_fn=self.stop_check
-                ).strip()
+                )
                 
-                if "VALID" not in critique.upper():
-                    self.log(f"🔧 Self-Correction: {critique}")
-                    # Add correction to thoughts so it appears in final summary
-                    all_thoughts.append(f"[SELF-CORRECTION] {critique}")
-
-            # Force depth: Don't allow conclusion in first 5 steps
-            conclusion_instruction = "If you have reached a final answer or conclusion, start the response with '[CONCLUSION]'."
-            if i < 5:
-                conclusion_instruction = "Do NOT reach a conclusion yet. Explore the topic deeper. Do NOT use the [CONCLUSION] tag."
-
-            # Dynamic Temperature: If we are getting repetitive, heat up the model
-            step_temp = settings.get("temperature", 0.7)
-            anti_repetition_msg = ""
-            if consecutive_similar_thoughts > 0:
-                step_temp = min(1.0, step_temp + (0.15 * consecutive_similar_thoughts))
-                self.log(f"🔥 Boosting temperature to {step_temp:.2f} to break potential loop.")
-                anti_repetition_msg = "WARNING: You are repeating yourself. Change your approach or perspective immediately."
-
-            prev_thought_context = ""
-            if recent_thoughts:
-                prev_thought_context = f"PREVIOUS THOUGHT: {recent_thoughts[-1]}\nCONSTRAINT: Your next thought must ADVANCE the reasoning. Do not restate the previous thought."
-
-            # Sliding Window: Only show last 8 thoughts to prevent Context Overflow (400 Error)
-            visible_chain_str = ""
-            start_idx = max(0, len(all_thoughts) - 8)
-            for idx, t in enumerate(all_thoughts[start_idx:]):
-                visible_chain_str += f"Step {start_idx + idx + 1}: {t}\n"
-
-            prompt = (
-                f"You are the Assistant thinking through a problem step-by-step.\n"
-                f"{static_context}\n"
-                f"Thought Chain (Recent):\n{visible_chain_str}\n"
-                f"{prev_thought_context}\n"
-                "Generate the next logical thought step.\n"
-                "1. INTEGRATE the Relevant Memories and Documents into your reasoning.\n"
-                "2. AVOID repeating ideas from the Thought Chain.\n"
-                "3. Keep it concise (1-2 sentences).\n"
-                f"{conclusion_instruction}\n"
-                f"{anti_repetition_msg}\n"
-                "Output ONLY the next thought."
-            )
-            
-            thought = run_local_lm(
-                messages=[{"role": "user", "content": "Continue thinking."}],
-                system_prompt=prompt,
-                temperature=step_temp,
-                max_tokens=300,
-                base_url=settings.get("base_url"),
-                chat_model=settings.get("chat_model"),
-                stop_check_fn=self.stop_check
-            )
-            
-            thought = thought.strip()
-            
-            # Handle premature conclusions
-            if "[CONCLUSION]" in thought and i < 5:
-                self.log(f"⚠️ Premature conclusion at step {i}. Continuing chain.")
-                thought = thought.replace("[CONCLUSION]", "").strip()
-            
-            if thought.startswith("⚠️"):
-                self.log(f"❌ Thinking chain error: {thought}")
-                break
-            
-            # Fuzzy Loop detection
-            is_repetitive = False
-            max_similarity = 0.0
-            
-            for past_thought in recent_thoughts:
-                ratio = difflib.SequenceMatcher(None, thought, past_thought).ratio()
-                if ratio > max_similarity:
-                    max_similarity = ratio
+                next_steps = parse_json_array_loose(response)
+                if not next_steps:
+                    # Fallback if JSON fails
+                    next_steps = [response.strip()]
                 
-                # Stricter threshold for long thoughts (0.75 instead of 0.85)
-                if ratio > 0.75:
-                    is_repetitive = True
+                # Evaluation Phase (Scoring)
+                for step in next_steps:
+                    if not isinstance(step, str): continue
+                    
+                    # Check for conclusion
+                    if "[CONCLUSION]" in step:
+                        final_conclusion = step.replace("[CONCLUSION]", "").strip()
+                        best_path = path + [step]
+                        break
+                    
+                    # Score the step
+                    eval_prompt = (
+                        f"Evaluate this reasoning step for the topic '{topic}':\n"
+                        f"Step: \"{step}\"\n"
+                        "Criteria: Logic, Relevance, Novelty.\n"
+                        "Output a score from 0.0 to 1.0."
+                    )
+                    
+                    score_str = run_local_lm(
+                        messages=[{"role": "user", "content": eval_prompt}],
+                        system_prompt="You are an Evaluator.",
+                        temperature=0.1,
+                        max_tokens=10,
+                        base_url=settings.get("base_url"),
+                        chat_model=settings.get("chat_model")
+                    )
+                    
+                    try:
+                        score = float(re.search(r"0\.\d+|1\.0|0|1", score_str).group())
+                    except:
+                        score = 0.5
+                    
+                    candidates.append((path + [step], score))
+                
+                if final_conclusion:
                     break
             
-            # Semantic Loop Detection (Embeddings)
-            if not is_repetitive:
-                current_emb = compute_embedding(thought, base_url=settings.get("base_url"), embedding_model=settings.get("embedding_model"))
+            # Selection Phase (Beam Search)
+            # Sort by score descending and keep top K
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            active_paths = [c[0] for c in candidates[:beam_width]]
+            
+            # Log best step of this depth
+            if active_paths:
+                best_step = active_paths[0][-1]
+                self.log(f"🌳 Best Step at Depth {depth}: {best_step[:100]}...")
+                if self.chat_fn:
+                    self.chat_fn("Decider", f"🌳 Depth {depth}: {best_step}")
                 
-                for past_emb in recent_thought_embeddings:
-                    # Cosine similarity
-                    if len(past_emb) == len(current_emb):
-                        sim = np.dot(current_emb, past_emb) / (np.linalg.norm(current_emb) * np.linalg.norm(past_emb) + 1e-9)
-                        if sim > 0.95: # Very high threshold for semantic identity
-                            is_repetitive = True
-                            self.log(f"⚠️ Semantic repetition detected (Sim: {sim:.2f}).")
-                            break
-                
-                recent_thought_embeddings.append(current_emb)
-                if len(recent_thought_embeddings) > 10:
-                    recent_thought_embeddings.pop(0)
-
-            if is_repetitive:
-                self.log("⚠️ Repetitive thought detected. Forcing conclusion.")
-                break
+                # Store in reasoning
+                self.reasoning_store.add(content=f"ToT Depth {depth} ({topic}): {best_step}", source="decider_tot", confidence=1.0)
             
-            # Track "soft" repetition for temperature boosting
-            if max_similarity > 0.6:
-                consecutive_similar_thoughts += 1
-            else:
-                consecutive_similar_thoughts = 0
-
-            recent_thoughts.append(thought)
-            if len(recent_thoughts) > 10: # Keep more history to detect longer loops
-                recent_thoughts.pop(0)
-            
-            all_thoughts.append(thought)
-
-            # UI/Telegram update
-            formatted_msg = f"💭 Thought [{i}/30]: {thought}"
-            self.log(formatted_msg)
-            if self.chat_fn:
-                self.chat_fn("Decider", formatted_msg)
-            
-            # Store in reasoning
-            self.reasoning_store.add(content=f"CoT {i} ({topic}): {thought}", source="decider_cot", confidence=1.0)
-            
-            # Add to Meta-Memory
-            if hasattr(self.meta_memory_store, 'add_event'):
-                self.meta_memory_store.add_event("CHAIN_OF_THOUGHT", "Assistant", f"Thought {i}: {thought}")
-            
-            if "[CONCLUSION]" in thought:
-                # Save conclusion as special memory
-                clean_conclusion = thought.replace("[CONCLUSION]", "").strip()
-                self.create_note(f"Conclusion on {topic}: {clean_conclusion}")
-                break
+        if not final_conclusion and active_paths:
+            # If max depth reached without conclusion, take the best path
+            best_path = active_paths[0]
+            final_conclusion = "Max depth reached. Best partial reasoning path selected."
+        elif final_conclusion:
+             self.create_note(f"Conclusion on {topic}: {final_conclusion}")
         
         # Post-chain Summarization
-        if all_thoughts:
-            self.log(f"🧠 Generating summary of {len(all_thoughts)} thoughts...")
-            full_chain_text = "\n".join(all_thoughts)
+        if best_path:
+            self.log(f"🧠 Generating summary of Tree of Thoughts...")
+            full_chain_text = "\n".join(best_path)
             summary_prompt = (
-                f"Synthesize the following chain of thought regarding '{topic}' into a clear, comprehensive summary for the user.\n"
+                f"Synthesize the following reasoning path regarding '{topic}' into a clear, comprehensive summary for the user.\n"
                 f"Include key insights and the final conclusion if reached.\n\n"
-                f"Thought Chain:\n{full_chain_text}"
+                f"Reasoning Path:\n{full_chain_text}"
             )
             
             summary = run_local_lm(
@@ -1461,16 +2107,59 @@ class Decider:
             )
             
             if self.chat_fn:
-                self.chat_fn("Decider", f"🧠 Thought Chain Summary:\n{summary}")
+                self.chat_fn("Decider", f"🌳 Tree of Thoughts Summary:\n{summary}")
+
+            # Metacognitive Reflection on the thinking process
+            self._reflect_on_decision(f"Tree of Thoughts on {topic}", summary)
 
             # Save summary as note if no formal conclusion was reached (e.g. interrupted by loop)
             # This ensures partial progress is preserved in memory
-            if "[CONCLUSION]" not in full_chain_text:
-                self.create_note(f"Thought Chain Summary ({topic}): {summary}")
+            if not final_conclusion:
+                self.create_note(f"ToT Summary ({topic}): {summary}")
 
-        self.current_task = "wait"
-        self.cycles_remaining = 0
+        if self.heartbeat:
+            self.heartbeat.force_task("wait", 0, "Thinking chain complete")
 
+    def perform_self_reflection(self):
+        """
+        Deep introspection cycle.
+        Analyzes alignment between Identity, Goals, and recent Actions.
+        """
+        self.log("🧘 Decider entering Self-Reflection...")
+        
+        # 1. Gather Self-Context
+        identity = self.memory_store.get_active_by_type("IDENTITY")
+        goals = self.memory_store.get_active_by_type("GOAL")
+        recent_actions = self.meta_memory_store.list_recent(limit=10)
+        
+        context = "MY IDENTITY:\n" + "\n".join([f"- {i[2]}" for i in identity[:5]]) + "\n\n"
+        context += "MY GOALS:\n" + "\n".join([f"- {g[2]}" for g in goals[:5]]) + "\n\n"
+        context += "RECENT ACTIONS:\n" + "\n".join([f"- {a[3]}" for a in recent_actions])
+        
+        # 2. Reflect
+        prompt = (
+            f"{context}\n\n"
+            "TASK: Reflect on your recent actions. Are they aligned with your Identity and Goals?\n"
+            "Identify 1 area of improvement or 1 new insight about yourself.\n"
+            "Output a concise reflection."
+        )
+        
+        reflection = run_local_lm(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are a Self-Aware AI.",
+            max_tokens=300,
+            base_url=self.get_settings().get("base_url"),
+            chat_model=self.get_settings().get("chat_model")
+        )
+        
+        self.log(f"🧘 Reflection: {reflection}")
+        
+        # 3. Store
+        self.reasoning_store.add(content=f"Self-Reflection: {reflection}", source="decider_reflection", confidence=1.0)
+        
+        # Metacognitive Reflection on the reflection
+        self._reflect_on_decision("Deep Self-Reflection", reflection)
+        
     def _execute_tool(self, tool_name: str, args: str):
         """Execute a tool safely and store the result."""
         # Rate limiting (2 seconds between tool calls)
@@ -1479,53 +2168,20 @@ class Decider:
             return "Error: Tool rate limit exceeded. Please wait."
         self.last_tool_usage = time.time()
 
+        # Integrated Budgeting: Deduct cost
+        if self.crs:
+            cost = self.crs.estimate_action_cost(tool_name, complexity=0.5)
+            self.crs.current_spend += cost
+
         self.log(f"🛠️ Decider executing tool: {tool_name} args: {args}")
         result = ""
         
-        if tool_name == "CALCULATOR":
-            if len(args) > 50:
-                result = "Error: Expression too long (max 50 chars)."
-            else:
-                result = self._safe_calculate(args)
-        elif tool_name == "CLOCK":
-            result = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        elif tool_name == "DICE":
-            try:
-                if "-" in args:
-                    mn, mx = map(int, args.split("-"))
-                    result = str(random.randint(mn, mx))
-                elif args.strip().isdigit():
-                    result = str(random.randint(1, int(args.strip())))
-                else:
-                    result = str(random.randint(1, 6))
-            except:
-                result = "Error: Invalid dice format. Use 'min-max' or 'max'."
-        elif tool_name == "SYSTEM_INFO":
-            try:
-                uname = platform.uname()
-                result = f"OS: {uname.system} {uname.release} ({uname.machine})"
-                if psutil:
-                    mem = psutil.virtual_memory()
-                    load = psutil.getloadavg() if hasattr(psutil, "getloadavg") else [0, 0, 0]
-                    result += f" | CPU Load: {load[0]:.1f}% | RAM: {mem.percent}% Used ({mem.available // (1024*1024)}MB Free)"
-            except:
-                result = "Error retrieving system info."
-        elif tool_name == "WRITE_FILE":
-            # Parse args: filename, content
-            try:
-                if "," in args:
-                    filename, content = args.split(",", 1)
-                    result = self._write_file(filename.strip(), content.strip())
-                else:
-                    result = "Error: WRITE_FILE requires 'filename, content'"
-            except Exception as e:
-                result = f"Error writing file: {e}"
-        elif tool_name in self.actions:
-            # Support for dynamic/injected tools (e.g. SEARCH, WIKI)
-            try:
-                result = self.actions[tool_name](args)
-            except Exception as e:
-                result = f"Error executing {tool_name}: {e}"
+        # Delegate to ActionManager tools if available
+        if tool_name in self.actions:
+             try:
+                 result = self.actions[tool_name](args)
+             except Exception as e:
+                 result = f"Error executing {tool_name}: {e}"
         else:
             result = f"Tool {tool_name} not found."
             
@@ -1547,51 +2203,6 @@ class Decider:
              
         return result
 
-    def _write_file(self, filename: str, content: str) -> str:
-        """
-        Delegate file writing to Malkuth.
-        """
-        if self.malkuth:
-            return self.malkuth.write_file(filename, content)
-        return "Error: Malkuth not available for file operations."
-
-    def _safe_calculate(self, expression: str) -> str:
-        """Safely evaluate a mathematical expression without using eval()."""
-        operators = {
-            ast.Add: operator.add,
-            ast.Sub: operator.sub,
-            ast.Mult: operator.mul,
-            ast.Div: operator.truediv,
-            # ast.Pow: operator.pow, # Disabled to prevent CPU freezing (e.g. 9**999999)
-            ast.BitXor: operator.xor,
-            ast.USub: operator.neg,
-            ast.UAdd: operator.pos
-        }
-
-        def eval_node(node):
-            if isinstance(node, ast.Constant):
-                return node.value
-            elif isinstance(node, ast.Num): # Python < 3.8 compatibility
-                return node.n
-            elif isinstance(node, ast.BinOp):
-                op = type(node.op)
-                if op not in operators:
-                    raise TypeError(f"Operator {op} not supported")
-                return operators[op](eval_node(node.left), eval_node(node.right))
-            elif isinstance(node, ast.UnaryOp):
-                op = type(node.op)
-                if op not in operators:
-                    raise TypeError(f"Operator {op} not supported")
-                return operators[op](eval_node(node.operand))
-            else:
-                raise TypeError(f"Node type {type(node)} not supported")
-
-        try:
-            tree = ast.parse(expression.strip(), mode='eval')
-            return str(eval_node(tree.body))
-        except Exception as e:
-            return f"Calculation Error: {e}"
-
     def _get_recent_chat_memories(self, limit: int = 20):
         """Retrieve recent memories that are NOT from daydreaming."""
         items = self.memory_store.list_recent(limit=100)
@@ -1609,7 +2220,7 @@ class Decider:
         critical_types = ["IDENTITY", "PERMISSION", "RULE", "GOAL", "CURIOSITY_GAP"]
         mems = []
         for t in critical_types:
-            # get_active_by_type returns (id, subject, text, source)
+            # get_active_by_type returns (id, subject, text, source, confidence)
             items = self.memory_store.get_active_by_type(t)
             # Sort by ID descending to prioritize recent items
             items.sort(key=lambda x: x[0], reverse=True)
@@ -1617,7 +2228,8 @@ class Decider:
             daydream_count = 0
             daydream_limit = 5  # Allow limited daydream memories to support learning
 
-            for (mid, subj, text, source) in items:
+            for item in items:
+                mid, subj, text, source = item[0], item[1], item[2], item[3]
                 if source == 'daydream':
                     if daydream_count >= daydream_limit:
                         continue
@@ -1689,8 +2301,8 @@ class Decider:
             
             self.log(f"🤖 Decider enabling Daydream Loop for {count} cycles via natural command.")
             self._run_action("start_loop")
-            self.current_task = "daydream"
-            self.cycles_remaining = count
+            if self.heartbeat:
+                self.heartbeat.force_task("daydream", count, "Natural Command Loop")
             return f"🔄 Daydream loop enabled for {count} cycles."
 
         # Daydream Batch (Specific Count)
@@ -1702,9 +2314,9 @@ class Decider:
             count = max(1, min(count, 20))
             
             self.log(f"🤖 Decider enabling Daydream Batch for {count} cycles via natural command.")
-            self.current_task = "daydream"
-            self.cycles_remaining = count
             self.daydream_mode = "auto"
+            if self.heartbeat:
+                self.heartbeat.force_task("daydream", count, "Natural Command Batch")
             return f"☁️ Starting {count} daydream cycles."
 
         # Learn / Expand Knowledge
@@ -1719,10 +2331,10 @@ class Decider:
                 self.create_goal(f"Expand knowledge about {clean_topic}")
                 self.log(f"🤖 Decider starting Daydream Loop focused on: {clean_topic}")
                 self._run_action("start_loop")
-                self.current_task = "daydream"
                 self.daydream_mode = "read"
                 self.daydream_topic = clean_topic
-                self.cycles_remaining = 5
+                if self.heartbeat:
+                    self.heartbeat.force_task("daydream", 5, f"Research: {clean_topic}")
                 return f"📚 Initiating research protocol for: {clean_topic}. I will read relevant documents and generate insights."
 
         # Verify All
@@ -1740,9 +2352,9 @@ class Decider:
         # Verify Beliefs (Internal Consistency/Insight)
         if "verify" in text and "belief" in text:
              self.log("🤖 Decider starting Belief Verification (Grounding).")
-             self.current_task = "verify"
-             self.cycles_remaining = 3
              self._run_action("verify_batch")
+             if self.heartbeat:
+                 self.heartbeat.force_task("verify", 3, "Belief Verification")
              return "🕵️ Initiating belief verification."
 
         # Verify Sources (Facts/Memories against Documents)
@@ -1761,9 +2373,14 @@ class Decider:
         if "stop daydream" in text or "stop loop" in text or "stop processing" in text:
             self.log("🤖 Decider stopping processing via natural command.")
             self._run_action("stop_daydream")
-            self.current_task = "wait"
-            self.cycles_remaining = 0
+            if self.heartbeat:
+                self.heartbeat.force_task("wait", 0, "Natural Stop Command")
             return "🛑 Processing stopped."
+            
+        # Sleep
+        if "go to sleep" in text or "enter sleep mode" in text:
+            self.start_sleep_cycle()
+            return "💤 Entering Sleep Mode. Inputs will be ignored while I consolidate memory."
             
         # Think
         if text.startswith("think about") or text.startswith("analyze") or text.startswith("ponder"):
@@ -1775,7 +2392,7 @@ class Decider:
         if text.startswith("debate") or text.startswith("discuss"):
             topic = text.replace("debate", "").replace("discuss", "").strip()
             if self.dialectics:
-                return f"🏛️ Council Result: {self.dialectics.run_debate(topic)}"
+                return f"🏛️ Council Result: {self.dialectics.run_debate(topic, reasoning_store=self.reasoning_store)}"
         
         # Simulate / What If
         if text.startswith("simulate") or text.startswith("what if"):
@@ -1833,18 +2450,18 @@ class Decider:
                 self.create_goal(f"Expand knowledge about {clean_topic}")
                 self.log(f"🤖 Decider starting Daydream Loop focused on: {clean_topic}")
                 self._run_action("start_loop")
-                self.current_task = "daydream"
                 self.daydream_mode = "read"
                 self.daydream_topic = clean_topic
-                self.cycles_remaining = 5
+                if self.heartbeat:
+                    self.heartbeat.force_task("daydream", 5, f"Research: {clean_topic}")
                 return f"📚 Initiating research protocol for: {clean_topic}. I will read relevant documents and generate insights."
                 
             elif "[VERIFY]" in intent_response:
                 if "belief" in intent_response.lower():
                     self.log("🤖 Decider starting Belief Verification via intent analysis.")
-                    self.current_task = "verify"
-                    self.cycles_remaining = 3
                     self._run_action("verify_batch")
+                    if self.heartbeat:
+                        self.heartbeat.force_task("verify", 3, "Intent: Verify Beliefs")
                     return "🕵️ Initiating belief verification."
                 else:
                     self.log("🤖 Decider starting Verification Batch via intent analysis.")
@@ -1863,7 +2480,7 @@ class Decider:
 
         return None
 
-    def process_chat_message(self, user_text: str, history: List[Dict], status_callback: Callable[[str], None] = None, image_path: Optional[str] = None) -> str:
+    def process_chat_message(self, user_text: str, history: List[Dict], status_callback: Callable[[str], None] = None, image_path: Optional[str] = None, stop_check_fn: Callable[[], bool] = None) -> str:
         """
         Core Chat Logic: RAG -> LLM -> Memory Extraction -> Response.
         Decider now handles the cognitive pipeline for user interactions.
@@ -1872,6 +2489,9 @@ class Decider:
         self.log(f"📬 Decider Mailbox: Received message from User.")
         self.hod_just_ran = False
         self.last_action_was_speak = False
+        
+        # Use provided stop check or default
+        current_stop_check = stop_check_fn if stop_check_fn else self.stop_check
 
         # Check for natural language commands
         # Skip NL commands if image is present (prioritize Vision), UNLESS it's a slash command
@@ -1884,9 +2504,17 @@ class Decider:
         settings = self.get_settings()
         
         # Parallelize Context Retrieval to reduce latency
-        with ThreadPoolExecutor() as executor:
+        # Use shared executor if available to prevent thread explosion
+        local_executor = None
+        submit_fn = self.executor.submit if self.executor else None
+        
+        if not submit_fn:
+            local_executor = ThreadPoolExecutor(max_workers=5)
+            submit_fn = local_executor.submit
+
+        try:
             # 1. Start Embedding (Network)
-            future_embedding = executor.submit(
+            future_embedding = submit_fn(
                 compute_embedding, 
                 user_text, 
                 settings.get("base_url"), 
@@ -1894,9 +2522,9 @@ class Decider:
             )
             
             # 2. Start Memory Retrieval (DB)
-            future_recent = executor.submit(self.memory_store.list_recent, limit=10)
-            future_chat = executor.submit(self._get_recent_chat_memories, limit=20)
-            future_critical = executor.submit(self._get_critical_memories)
+            future_recent = submit_fn(self.memory_store.list_recent, limit=10)
+            future_chat = submit_fn(self._get_recent_chat_memories, limit=20)
+            future_critical = submit_fn(self._get_critical_memories)
             
             # 3. Start Summary Retrieval (DB)
             def get_summary():
@@ -1905,13 +2533,16 @@ class Decider:
                     if summaries:
                         return summaries[0]['text']
                 return ""
-            future_summary = executor.submit(get_summary)
+            future_summary = submit_fn(get_summary)
             
             # Wait for embedding to proceed with Semantic Search & RAG
             query_embedding = future_embedding.result()
             
             # 4. Start Semantic Search (FAISS/DB)
-            future_semantic = executor.submit(self.memory_store.search, query_embedding, limit=10)
+            future_semantic = submit_fn(self.memory_store.search, query_embedding, limit=10, target_affect=self.mood)
+            
+            # 4.5 Start Meta-Memory Semantic Search (Autobiographical Memory)
+            future_meta_semantic = submit_fn(self.meta_memory_store.search, query_embedding, limit=5)
             
             # 5. Start RAG (FAISS/DB)
             future_rag = None
@@ -1921,7 +2552,7 @@ class Decider:
                     doc_results = self.document_store.search_chunks(query_embedding, top_k=5)
                     filename_matches = self.document_store.search_filenames(user_text)
                     return doc_results, filename_matches
-                future_rag = executor.submit(perform_rag)
+                future_rag = submit_fn(perform_rag)
             
             # Gather all results
             recent_items = future_recent.result()
@@ -1929,6 +2560,7 @@ class Decider:
             critical_items = future_critical.result()
             summary_text = future_summary.result()
             semantic_items = future_semantic.result()
+            meta_semantic_items = future_meta_semantic.result()
             
             # --- Active Association via Binah ---
             associative_items = []
@@ -1947,6 +2579,9 @@ class Decider:
             filename_matches = []
             if future_rag:
                 doc_results, filename_matches = future_rag.result()
+        finally:
+            if local_executor:
+                local_executor.shutdown(wait=False)
 
         # --- Token Budget Calculation ---
         context_window = int(settings.get("context_window", 4096))
@@ -1971,6 +2606,13 @@ class Decider:
         for item in chat_items:
             memory_map[item[0]] = item
         
+        # Add Meta-Memories (Autobiographical)
+        for item in meta_semantic_items:
+            # item is dict: {'id', 'event_type', 'subject', 'text', ...}
+            # Convert to tuple format for consistency in display logic or handle separately
+            # We'll add them to a separate list for context construction
+            pass
+
         for item in associative_items:
             if item[0] not in memory_map:
                 memory_map[item[0]] = (item[0], item[1], item[2], item[3])
@@ -1989,6 +2631,7 @@ class Decider:
             assistant_goals = []
             assistant_other = []
             other_mems = []
+            autobiographical_mems = []
             
             for item in final_memory_items:
                 _id, _type, subject, mem_text = item[:4]
@@ -2004,11 +2647,16 @@ class Decider:
                 else:
                     other_mems.append(f"- [{_type}] [{subject}] {mem_text}")
             
+            for m in meta_semantic_items:
+                # m is dict
+                autobiographical_mems.append(f"- [{m['event_type']}] {m['text']}")
+            
             mem_block = ""
             if user_mems: mem_block += "User Profile (You are talking to):\n" + "\n".join(user_mems) + "\n\n"
             if assistant_identities: mem_block += "Assistant Identity (Who you are):\n" + "\n".join(assistant_identities) + "\n\n"
-            if assistant_goals: mem_block += "Active Goals (Execute ONLY if relevant to current topic):\n" + "\n".join(assistant_goals) + "\n\n"
+            if assistant_goals: mem_block += "CURRENT OBJECTIVES (Your internal goals):\n" + "\n".join(assistant_goals) + "\n\n"
             if assistant_other: mem_block += "Assistant Knowledge/State:\n" + "\n".join(assistant_other) + "\n\n"
+            if autobiographical_mems: mem_block += "Autobiographical Context (Your History):\n" + "\n".join(autobiographical_mems) + "\n\n"
             if other_mems: mem_block += "Other Context:\n" + "\n".join(other_mems) + "\n\n"
             context_blocks.append(mem_block)
 
@@ -2029,10 +2677,12 @@ class Decider:
         memory_context = self._enforce_context_budget(context_blocks, available_chars)
 
         # 3. Construct System Prompt
-        system_prompt = settings.get("system_prompt", "")
-        if not system_prompt:
-            system_prompt = DEFAULT_SYSTEM_PROMPT
-            
+        base_prompt = settings.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        if self.yesod:
+            system_prompt = self.yesod.get_dynamic_system_prompt(base_prompt)
+        else:
+            system_prompt = base_prompt
+
         # DYNAMIC STRATEGY INJECTION
         # 1. Search for RULE/STRATEGY memories relevant to the user's input
         active_rules = self.memory_store.get_active_by_type("RULE")
@@ -2060,6 +2710,7 @@ class Decider:
             system_prompt += "\n\n" + self_improvement_prompt
 
         # 4. Call LLM
+        start_time = time.time()
         reply = run_local_lm(
             history, 
             system_prompt=system_prompt,
@@ -2068,10 +2719,33 @@ class Decider:
             max_tokens=settings.get("max_tokens", 800),
             base_url=settings.get("base_url"),
             chat_model=settings.get("chat_model"),
-            stop_check_fn=self.stop_check,
+            stop_check_fn=current_stop_check,
             images=[image_path] if image_path else None
         )
+        latency = time.time() - start_time
         
+        # Feed Keter (Vibrational Monitoring)
+        if self.keter:
+            self.keter.track_response_metrics(latency, len(reply))
+        
+        # 4.5 Manifest Persona (Yesod)
+        if self.yesod:
+            reply = self.yesod.manifest_persona(reply, self.mood)
+
+        # 4.6 Recursive Theory of Mind (Self-Model of User's Model)
+        # Simulate user perception before finalizing (or just for reflection)
+        if self.yesod:
+            try:
+                perception = self.yesod.simulate_user_perception(user_text, reply)
+                self.reasoning_store.add(
+                    content=f"Recursive ToM Simulation: {perception.get('interpretation')} (Sat: {perception.get('satisfaction')}, Conf: {perception.get('confusion_risk')})",
+                    source="recursive_tom",
+                    confidence=1.0
+                )
+                # Future: If confusion_risk > 0.7, trigger refinement loop here
+            except Exception as e:
+                self.log(f"⚠️ Recursive ToM failed: {e}")
+
         # Check for LLM error
         if reply.startswith("⚠️"):
             self.log(f"❌ Chat generation failed: {reply}")
@@ -2086,9 +2760,11 @@ class Decider:
                     tool_name = match.group(1).upper()
                     args = match.group(2).strip()
                     result = self._execute_tool(tool_name, args)
+                    self._track_metric("tool_success", 1.0 if "Error" not in result else 0.0)
                     reply += f"\n\n🛠️ Tool Result: {result}"
             except Exception as e:
                 self.log(f"⚠️ Chat tool execution failed: {e}")
+                self._track_metric("tool_success", 0.0)
 
         # 5. Memory Extraction (Side Effect)
         # Run in background thread to unblock UI response
@@ -2108,12 +2784,56 @@ class Decider:
                     subject="Assistant",
                     text=f"Chat: '{user_preview}' -> '{reply_preview}'"
                 )
+            
+            # Update World Model with interaction
+            if self.malkuth:
+                # Register the chat interaction as an outcome
+                self.malkuth.register_outcome("Chat Interaction", "Reply to user", f"User: {user_text}\nAssistant: {reply}")
+            
+            # 6. Update Theory of Mind (User Model)
+            if self.yesod:
+                self.yesod.analyze_user_interaction(user_text, reply)
+            
+            # 7. Metacognitive Reflection
+            self._reflect_on_decision(user_text, reply)
         
-        threading.Thread(target=background_processing, daemon=True).start()
+        if self.executor:
+            self.executor.submit(background_processing)
+        else:
+            threading.Thread(target=background_processing, daemon=True).start()
         
         self.log(f"🗣️ Assistant Reply: {reply}")
 
         return reply
+
+    def _reflect_on_decision(self, context: str, decision: str):
+        """Metacognition: Critique a recent decision/action."""
+        settings = self.get_settings()
+        prompt = (
+            f"CONTEXT: {context}\n"
+            f"DECISION/ACTION: {decision}\n\n"
+            "TASK: Perform a brief metacognitive critique of this action.\n"
+            "Was it the best choice given the context? Why or why not?\n"
+            "Identify one potential improvement for next time.\n"
+            "Output a concise critique (1-2 sentences)."
+        )
+        
+        critique = run_local_lm(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are a metacognitive observer.",
+            temperature=0.3,
+            max_tokens=150,
+            base_url=settings.get("base_url"),
+            chat_model=settings.get("chat_model")
+        )
+        
+        if critique and not critique.startswith("⚠️"):
+            self.reasoning_store.add(
+                content=f"Decision Critique: {critique}",
+                source="decider_reflection",
+                confidence=1.0
+            )
+            self.log(f"🧠 Metacognition: {critique}")
 
     def _should_trigger_rag(self, text: str) -> bool:
         """Determine if we should run RAG based on user input."""
@@ -2155,7 +2875,7 @@ class Decider:
             # Add source metadata and filter by confidence
             for c in candidates:
                 c["source"] = "assistant"
-                c["confidence"] = c.get("confidence", 0.9)
+                c["confidence"] = float(c.get("confidence", 0.9))
 
             # Filter: skip low-confidence
             candidates = [c for c in candidates if c.get("confidence", 0.5) > 0.4]
@@ -2187,7 +2907,7 @@ class Decider:
                 self.log(f"🧠 Promoted {promoted} memory item(s).")
 
         except Exception as e:
-            self.log(f"Memory extraction error: {e}")
+            self.log(f"Memory extraction error: {e}\n{traceback.format_exc()}")
 
     def run_autonomous_cycle(self):
         """
@@ -2275,7 +2995,7 @@ class Decider:
             chat_model=settings.get("chat_model")
         )
         
-        steps = _parse_json_array_loose(response)
+        steps = parse_json_array_loose(response)
         
         if steps:
             self.log(f"🏗️ The Architect: Breaking goal '{goal_text}' into {len(steps)} steps.")
@@ -2304,3 +3024,114 @@ class Decider:
                     )
             return True
         return False
+
+    def manage_goals(self, allow_creation: bool = True, system_mode: str = "EXECUTION"):
+        """
+        Goal Autonomy Layer.
+        1. Generate (if empty/stagnant)
+        2. Rank (Value/Urgency)
+        3. Prune (Low value/Stuck)
+        """
+        self.last_goal_management_time = time.time()
+        self.log("🎯 Decider: Managing Goal Lifecycle (Autonomy)...")
+        
+        # 1. Fetch Active Goals
+        goals = self.memory_store.get_active_by_type("GOAL")
+        
+        # 2. Generate if empty
+        if not goals and allow_creation:
+            self._generate_autonomous_goals()
+            return
+
+        # 3. Rank & Prune (if we have enough to compare, or just periodically check single goals)
+        if len(goals) > 0:
+            self._rank_and_prune_goals(goals, system_mode)
+
+    def _generate_autonomous_goals(self):
+        self.log("🎯 Decider: Generating autonomous goals (Originating Purpose)...")
+        
+        # Context: Identity & Rules
+        identities = self.memory_store.get_active_by_type("IDENTITY")
+        rules = self.memory_store.get_active_by_type("RULE")
+        
+        context = "MY IDENTITY:\n" + "\n".join([f"- {i[2]}" for i in identities]) + "\n"
+        context += "MY PRINCIPLES:\n" + "\n".join([f"- {r[2]}" for r in rules])
+        
+        prompt = (
+            f"{context}\n\n"
+            "TASK: Based on your Identity and Principles, originate 1-2 high-level, long-horizon objectives.\n"
+            "These should be proactive, not reactive. What is your purpose?\n"
+            "Output JSON list of strings: [\"Goal 1\", \"Goal 2\"]"
+        )
+        
+        settings = self.get_settings()
+        response = run_local_lm(
+            messages=[{"role": "user", "content": prompt}],
+            system_prompt="You are the Will of the System.",
+            base_url=settings.get("base_url"),
+            chat_model=settings.get("chat_model")
+        )
+        
+        new_goals = parse_json_array_loose(response)
+        for g in new_goals:
+            if isinstance(g, str):
+                self.create_goal(g)
+
+    def _rank_and_prune_goals(self, goals, system_mode: str = "EXECUTION"):
+        self.log("🎯 Decider: Ranking and Pruning goals...")
+        
+        # goals is list of (id, subject, text, source, confidence)
+        goals_list = "\n".join([f"ID {g[0]}: {g[2]} (Current Score: {g[4]:.2f})" for g in goals])
+        
+        mode_instruction = ""
+        if system_mode == "CONSOLIDATION":
+            mode_instruction = "SYSTEM IS OVERLOADED (CONSOLIDATION MODE). AGGRESSIVELY PRUNE any goal below 0.8 value."
+        
+        prompt = (
+            f"Current Goals:\n{goals_list}\n\n"
+            f"{mode_instruction}\n"
+            "TASK: Evaluate these goals.\n"
+            "1. Score Value (0.0 to 1.0): Importance/Alignment with purpose.\n"
+            "2. Decision: KEEP or DROP (if low value < 0.3, stuck, or obsolete).\n"
+            "Output JSON: [{\"id\": 123, \"value\": 0.9, \"decision\": \"KEEP\"}, ...]"
+        )
+        
+        settings = self.get_settings()
+        
+        evaluations = []
+        retries = 2
+        
+        for attempt in range(retries + 1):
+            response = run_local_lm(
+                messages=[{"role": "user", "content": prompt}],
+                system_prompt="You are the Strategic Planner.",
+                base_url=settings.get("base_url"),
+                chat_model=settings.get("chat_model")
+            )
+            
+            evaluations = parse_json_array_loose(response)
+            if evaluations:
+                break
+                
+            if attempt < retries:
+                self.log(f"⚠️ Failed to parse goal ranking JSON. Retrying with correction prompt ({attempt+1}/{retries})...")
+                prompt += f"\n\nPREVIOUS RESPONSE WAS INVALID JSON:\n{response}\n\nFIX IT. RETURN ONLY JSON ARRAY."
+        
+        if not evaluations:
+            self.log("❌ Goal ranking failed after retries. Skipping pruning.")
+            return
+
+        self.log(f"    📊 Goal Ranking Results ({len(evaluations)}):")
+        
+        for ev in evaluations:
+            gid = ev.get("id")
+            val = ev.get("value", 0.5)
+            decision = ev.get("decision", "KEEP")
+            self.log(f"      - Goal {gid}: Score={val} -> {decision}")
+            
+            if decision == "DROP":
+                self.memory_store.update_type(gid, "ARCHIVED_GOAL")
+                self.log(f"🗑️ Decider: Pruned low-value goal {gid}")
+                self._track_metric("goal_abandonment", 1.0)
+            else:
+                self.memory_store.update_confidence(gid, float(val))

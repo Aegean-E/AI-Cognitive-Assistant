@@ -1,12 +1,12 @@
-import time
+import os
 import json
 import re
 import random
 import threading
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional, Any
-from lm import run_local_lm, compute_embedding
-from event_bus import EventBus
+from ai_core.lm import run_local_lm, compute_embedding
 
 HOD_SYSTEM_PROMPT = (
     "You are Hod, the Reflective Analyst of this cognitive architecture. "
@@ -30,9 +30,11 @@ class Hod:
         get_settings_fn: Callable[[], Dict],
         get_main_logs_fn: Callable[[], str],
         get_doc_logs_fn: Callable[[], str],
-        max_inconclusive_attempts: int = 3,
-        max_retrieval_failures: int = 3,
-        log_fn: Callable[[str], None] = print
+        log_fn: Callable[[str], None] = logging.info,
+        meta_learner=None,
+        embed_fn: Optional[Callable[[str], Any]] = None,
+        event_bus: Optional[Any] = None,
+        executor: Optional[ThreadPoolExecutor] = None
     ):
         self.memory_store = memory_store
         self.meta_memory_store = meta_memory_store
@@ -41,27 +43,66 @@ class Hod:
         self.get_settings = get_settings_fn
         self.get_main_logs = get_main_logs_fn
         self.get_doc_logs = get_doc_logs_fn
-        self.max_inconclusive_attempts = max_inconclusive_attempts
-        self.max_retrieval_failures = max_retrieval_failures
         self.log = log_fn
+        self.meta_learner = meta_learner
+        self.embed_fn = embed_fn
+        self.event_bus = event_bus
+        self.executor = executor
+        self.state_file = "./data/hod_state.json"
         
         # Initialize cursors for incremental analysis
         self.last_memory_id = 0
         self.last_meta_id = 0
         self.last_reasoning_id = 0
+        self.last_analysis_summary = "System Initialized"
         self._init_cursors()
 
     def _init_cursors(self):
-        """Initialize cursors to recent history to avoid re-processing entire DB on startup."""
+        """
+        Initialize cursors.
+        Try to load from persistent state file first.
+        Fallback to recent history heuristic if no state exists.
+        """
         try:
-            max_mem = self.memory_store.get_max_id()
-            self.last_memory_id = max(0, max_mem - 20)
-            max_meta = self.meta_memory_store.get_max_id()
-            self.last_meta_id = max(0, max_meta - 20)
-            max_reas = self.reasoning_store.get_max_id()
-            self.last_reasoning_id = max(0, max_reas - 20)
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                    self.last_memory_id = state.get("last_memory_id", 0)
+                    self.last_meta_id = state.get("last_meta_id", 0)
+                    self.last_reasoning_id = state.get("last_reasoning_id", 0)
+                    self.log(f"🔮 Hod: Restored cursor state (Mem: {self.last_memory_id}, Meta: {self.last_meta_id}, Reas: {self.last_reasoning_id})")
+            else:
+                # Fallback: Start near the end to avoid massive re-processing on fresh install/reset
+                max_mem = self.memory_store.get_max_id()
+                self.last_memory_id = max(0, max_mem - 20)
+                max_meta = self.meta_memory_store.get_max_id()
+                self.last_meta_id = max(0, max_meta - 20)
+                max_reas = self.reasoning_store.get_max_id()
+                self.last_reasoning_id = max(0, max_reas - 20)
         except Exception as e:
             self.log(f"⚠️ Hod cursor init failed: {e}")
+
+    def _save_state(self):
+        """Persist cursor state to disk."""
+        try:
+            temp_path = self.state_file + ".tmp"
+            with open(temp_path, 'w') as f:
+                json.dump({
+                    "last_memory_id": self.last_memory_id,
+                    "last_meta_id": self.last_meta_id,
+                    "last_reasoning_id": self.last_reasoning_id
+                }, f)
+            os.replace(temp_path, self.state_file)
+        except Exception as e:
+            self.log(f"⚠️ Hod state save failed: {e}")
+            
+    def _track_metric(self, metric: str, value: float):
+        if self.meta_learner:
+            self.meta_learner.track(metric, value)
+            
+    def analyze(self) -> str:
+        """Return the latest analysis summary for the Decider."""
+        return self.last_analysis_summary
 
     def reflect(self, trigger: str = "Manual") -> Dict:
         """
@@ -208,6 +249,12 @@ class Hod:
 
             analysis_result["findings"] = "\n".join(findings_buffer)
             self.log(f"🔮 Hod Analysis: {analysis_result['findings']}")
+            self.last_analysis_summary = analysis_result['findings'][:100] + "..." if analysis_result['findings'] else "No significant findings."
+            
+            if self.event_bus and analysis_result['findings']:
+                self.event_bus.publish("HOD_ANALYSIS", {"text": analysis_result['findings']})
+                
+            self._save_state()
             
         except Exception as e:
             self.log(f"❌ Hod analysis error: {e}")
@@ -223,20 +270,22 @@ class Hod:
         if not self.document_store:
             return []
             
-        # Get all active memories
-        all_memories = self._get_all_memories()
+        # Optimization: Fetch only relevant candidates directly from DB
+        # We need unverified FACTs/BELIEFs from 'daydream' source
+        candidates = self._get_verification_candidates()
+        
         proposals = []
 
         # 1. Cleanup: Remove memories that refer to documents but lack citation
         # Includes BELIEF here because uncited beliefs about documents are also invalid
-        cleanup_types = {"FACT", "BELIEF"}
-        uncited_candidates = [
-            m for m in all_memories
-            if "[Source:" not in m['text'] and "[Supported by" not in m['text'] and m['type'] in cleanup_types and m.get('source') == 'daydream'
-        ]
-        
         triggers = ["the document", "this document", "the study", "this study", "the research", "this research", 
                     "the pdf", "this pdf", "the findings", "these findings", "the article", "this article", "the text"]
+        
+        # Filter for cleanup candidates from the main list
+        uncited_candidates = [
+            m for m in candidates
+            if "[Source:" not in m['text'] and "[Supported by" not in m['text']
+        ]
         
         for mem in uncited_candidates:
             if stop_check_fn and stop_check_fn():
@@ -253,14 +302,6 @@ class Hod:
                 })
 
         # 2. Verify cited memories
-        # Filter for those with a source citation AND allowed types
-        # Including BELIEF to ensure groundedness.
-        # NEW: Also include uncited BELIEFs for Open Grounding (Cognitive Evaluation).
-        target_types = {"FACT", "BELIEF"}
-        candidates = [
-            m for m in all_memories 
-            if m['type'] in target_types and not m.get('verified') and m.get('source') == 'daydream' and (("[Source:" in m['text'] or "[Supported by" in m['text']) or m['type'] in ('BELIEF', 'FACT'))
-        ]
         
         if not candidates and not proposals:
             return proposals
@@ -274,13 +315,15 @@ class Hod:
         batch.sort(key=lambda m: re.search(r"\[(?:Source|Supported by): (.*?)\]", m['text']).group(1).strip().strip('"').strip("'") if re.search(r"\[(?:Source|Supported by): (.*?)\]", m['text']) else "")
         
         # Parallel Execution
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {executor.submit(self._verify_single_memory, mem): mem for mem in batch}
+        if self.executor:
+            futures = {self.executor.submit(self._verify_single_memory, mem): mem for mem in batch}
             
             for future in as_completed(futures):
                 if stop_check_fn and stop_check_fn():
                     self.log("🛑 [Verifier] Verification stopped by user.")
-                    executor.shutdown(wait=False, cancel_futures=True)
+                    # Cannot shutdown shared executor, just break loop and let futures finish/cancel
+                    for f in futures:
+                        f.cancel()
                     break
                 
                 try:
@@ -289,6 +332,20 @@ class Hod:
                         proposals.append(result)
                 except Exception as e:
                     self.log(f"❌ [Verifier] Thread error: {e}")
+        else:
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {executor.submit(self._verify_single_memory, mem): mem for mem in batch}
+                for future in as_completed(futures):
+                    if stop_check_fn and stop_check_fn():
+                        self.log("🛑 [Verifier] Verification stopped by user.")
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    try:
+                        result = future.result()
+                        if result:
+                            proposals.append(result)
+                    except Exception as e:
+                        self.log(f"❌ [Verifier] Thread error: {e}")
 
         return proposals
 
@@ -297,6 +354,8 @@ class Hod:
         Worker function for verifying a single memory.
         Returns a dict with action instructions or None.
         """
+        max_retrieval_failures = int(self.get_settings().get("max_retrieval_failures", 3))
+        max_inconclusive_attempts = int(self.get_settings().get("max_inconclusive_attempts", 3))
         try:
             # Get thread name for logging concurrency
             t_name = threading.current_thread().name
@@ -343,7 +402,7 @@ class Hod:
                 
                 # Count as retrieval failure
                 attempts = mem.get('verification_attempts', 0) + 1
-                if attempts >= self.max_retrieval_failures:
+                if attempts >= max_retrieval_failures:
                     return {
                         "proposal": "DELETE",
                         "memory_id": mem['id'],
@@ -362,10 +421,18 @@ class Hod:
             chunk_map = {c['chunk_index']: c['text'] for c in all_chunks}
                 
             # Search chunks in that document using the memory's content
-            query_emb = compute_embedding(clean_text)
+            if self.embed_fn:
+                query_emb = self.embed_fn(clean_text)
+            else:
+                query_emb = compute_embedding(clean_text)
 
             # Use optimized local search in document store
             search_results = self.document_store.search_chunks(query_emb, top_k=5, document_id=doc_id)
+            
+            if search_results:
+                 self.log(f"    🔍 [Verifier] Top chunk match: {search_results[0]['similarity']:.4f} (Threshold: 0.45)")
+            else:
+                 self.log(f"    🔍 [Verifier] No chunks found via vector search.")
             
             # Fallback: Cross-Lingual / Keyword Search Generation
             # If results are poor (e.g. top similarity < 0.45), try to generate a better query
@@ -385,7 +452,10 @@ class Hod:
                 
                 if better_query and better_query != clean_text:
                     self.log(f"🔍 [Verifier][Worker-{worker_id}] Retrying search with generated query: '{better_query}'")
-                    query_emb_2 = compute_embedding(better_query)
+                    if self.embed_fn:
+                        query_emb_2 = self.embed_fn(better_query)
+                    else:
+                        query_emb_2 = compute_embedding(better_query)
                     search_results_2 = self.document_store.search_chunks(query_emb_2, top_k=5, document_id=doc_id)
                     
                     if search_results_2:
@@ -396,7 +466,7 @@ class Hod:
                 
                 # Check attempts limit (Read-only check)
                 attempts = mem.get('verification_attempts', 0) + 1
-                if attempts >= self.max_retrieval_failures:
+                if attempts >= max_retrieval_failures:
                     return {
                         "proposal": "DELETE",
                         "memory_id": mem['id'],
@@ -517,7 +587,7 @@ class Hod:
                 
                 # Check attempts limit
                 attempts = mem.get('verification_attempts', 0) + 1
-                if attempts >= self.max_inconclusive_attempts:
+                if attempts >= max_inconclusive_attempts:
                     return {
                         "proposal": "DELETE",
                         "memory_id": mem['id'],
@@ -540,11 +610,15 @@ class Hod:
         Perform Open Grounding (Cognitive Evaluation) for an uncited belief or fact.
         Searches all documents for evidence to support or refute the item.
         """
+        max_inconclusive_attempts = int(self.get_settings().get("max_inconclusive_attempts", 3))
         item_type = mem['type']
         self.log(f"🔍 [Verifier][Worker-{worker_id}] Grounding Uncited {item_type} {mem['id']}:\n    \"{mem['text']}\"")
         
         # 1. Search for relevant documents
-        query_emb = compute_embedding(mem['text'])
+        if self.embed_fn:
+            query_emb = self.embed_fn(mem['text'])
+        else:
+            query_emb = compute_embedding(mem['text'])
         
         # Detect embedded filename to restrict search scope (Prevent Cross-Document Contamination)
         embedded_filename = None
@@ -566,7 +640,7 @@ class Hod:
             
             # Count as inconclusive attempt
             attempts = mem.get('verification_attempts', 0) + 1
-            if attempts >= self.max_inconclusive_attempts:
+            if attempts >= max_inconclusive_attempts:
                 return {
                     "proposal": "DELETE",
                     "memory_id": mem['id'],
@@ -689,7 +763,7 @@ class Hod:
         
         # Check attempts limit
         attempts = mem.get('verification_attempts', 0) + 1
-        if attempts >= self.max_inconclusive_attempts:
+        if attempts >= max_inconclusive_attempts:
             return {
                 "proposal": "DELETE",
                 "memory_id": mem['id'],
@@ -720,13 +794,16 @@ class Hod:
             """, target_types).fetchone()
         return row[0] if row else 0
 
-    def _get_all_memories(self) -> List[Dict]:
-        """Get ALL memories regardless of age."""
+    def _get_verification_candidates(self) -> List[Dict]:
+        """Fetch unverified memories from daydream source."""
         with self.memory_store._connect() as con:
             rows = con.execute("""
                 SELECT id, identity, parent_id, type, subject, text, confidence, source, created_at, embedding, verified, verification_attempts
                 FROM memories
                 WHERE parent_id IS NULL AND deleted = 0
+                AND verified = 0
+                AND type IN ('FACT', 'BELIEF')
+                AND source = 'daydream'
                 ORDER BY created_at DESC
             """).fetchall()
 
