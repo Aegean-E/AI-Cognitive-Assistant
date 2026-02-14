@@ -114,6 +114,7 @@ class Decider:
         self.interrupted = False # Flag for interrupt-priority architecture
         self.panic_mode = False
         self.is_sleeping = False
+        self.topic_history = []
         self.stream_of_consciousness = [] # Injected by AIController
         self.last_internal_thought = None
         self.thought_history = [] # Track recent thoughts to prevent loops
@@ -476,7 +477,17 @@ class Decider:
         # Check for simple repetition (A-A-A) if not WAIT
         if self.command_history[-1] != "WAIT" and (self.command_history[-1] == self.command_history[-2] == self.command_history[-3]):
             return True
-            
+
+        topic_match = re.search(r"\[(?:THINK|DAYDREAM|DEBATE|SIMULATE):.*?,.*?,?(.*?)\]", command, re.IGNORECASE)
+        if topic_match:
+            topic = topic_match.group(1).strip().lower()
+            if topic:
+                self.topic_history.append(topic)
+                if len(self.topic_history) > 6: self.topic_history.pop(0)
+                if self.topic_history.count(topic) >= 4:
+                    self.log(f"🛑 Topic Stagnation detected: '{topic}'. Forcing cognitive shift.")
+                    return True
+
         # Check for Thought Loop (heuristic: if we keep planning but not acting)
         if self.command_history.count("THINK") > 3 and len(self.command_history) < 8:
              return True
